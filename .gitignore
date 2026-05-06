@@ -1,0 +1,47 @@
+# Binaries and executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.zip
+
+# Model files
+*.gguf
+*.bin
+
+# Temp and cache
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.cache
+
+# Logs
+*.log
+logs/
+
+# Local configs and secrets
+.claude/settings.local.json
+*.auth.json
+auth.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Windows junk
+nul
+
+# Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
