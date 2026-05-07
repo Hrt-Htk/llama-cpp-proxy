@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -375,19 +376,19 @@ class ChatLogger:
         self._raw_fh = open(self.raw_file, "a", encoding="utf-8")
         self._date = date
 
-    async def log_request(self, method: str, path: str, body: bytes | None) -> None:
+    async def log_request(self, method: str, path: str, body: bytes | None, req_id: str) -> None:
         async with self._lock:
             self._open_for_today()
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             self._session_id = ts
-            self._fh.write(f"=== [{ts}] {method} {path} ===\n")
+            self._fh.write(f"=== [{ts}] [req={req_id}] {method} {path} ===\n")
             if body and path.rstrip("/") == "/v1/chat/completions":
                 self._write_latest_user_turn(body)
             self._fh.flush()
-            self._write_raw(ts, method, path, body)
+            self._write_raw(ts, method, path, body, req_id)
 
-    def _write_raw(self, ts: str, method: str, path: str, body: bytes | None) -> None:
-        record: dict[str, object] = {"ts": ts, "method": method, "path": path}
+    def _write_raw(self, ts: str, method: str, path: str, body: bytes | None, req_id: str) -> None:
+        record: dict[str, object] = {"ts": ts, "req_id": req_id, "method": method, "path": path}
         if body is None:
             record["body"] = None
         elif len(body) > RAW_BODY_CAP:
@@ -572,15 +573,19 @@ def configure_logging() -> None:
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d.log")
 
-    # Console handler — live output
+    # Force every log handler (and aiohttp's access logger) onto UTC so timestamps
+    # line up with the chat log, which is already UTC.
+    logging.Formatter.converter = time.gmtime
+
+    fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
+
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    console.setFormatter(fmt)
 
-    # File handler — daily rotation
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    file_handler.setFormatter(fmt)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -806,6 +811,8 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     manager: ServerManager = request.app["manager"]
     session: ClientSession = request.app["session"]
 
+    req_id = secrets.token_hex(4)
+    started = time.monotonic()
     manager.begin_request()
     chat_logger: ChatLogger | None = request.app.get("chat_logger")
     try:
@@ -813,7 +820,7 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         body = _inject_cache_prompt(body, request.method, request.path)
         await manager.ensure_running()
     except Exception as exc:
-        logging.exception("Backend is unavailable")
+        logging.exception("[req=%s] Backend is unavailable", req_id)
         manager.end_request()
         return web.json_response(
             {"error": "backend unavailable", "detail": str(exc)},
@@ -821,11 +828,12 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             headers={
                 "Retry-After": str(RETRY_AFTER_SECONDS),
                 "X-Backend": manager.state,
+                "X-Request-ID": req_id,
             },
         )
 
     if chat_logger is not None:
-        await chat_logger.log_request(request.method, request.path, body)
+        await chat_logger.log_request(request.method, request.path, body, req_id)
 
     target_url = f"{manager.config.backend_base_url}{request.rel_url}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
@@ -843,6 +851,7 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
 
         response_headers = filter_response_headers(upstream_resp.headers)
         response_headers["X-Backend"] = "online"
+        response_headers["X-Request-ID"] = req_id
 
         downstream = web.StreamResponse(
             status=upstream_resp.status,
@@ -882,18 +891,22 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 async for chunk in upstream_resp.content.iter_any():
                     await downstream.write(chunk)
         except ConnectionResetError:
-            logging.info("Client disconnected while streaming %s %s", request.method, request.rel_url)
+            logging.info("[req=%s] Client disconnected while streaming %s %s", req_id, request.method, request.rel_url)
         finally:
             with contextlib.suppress(ConnectionResetError, RuntimeError):
                 await downstream.write_eof()
-
+            duration_ms = int((time.monotonic() - started) * 1000)
+            logging.info(
+                "[req=%s] %s %s -> %s in %dms",
+                req_id, request.method, request.rel_url, downstream.status, duration_ms,
+            )
             return downstream
     except ClientError as exc:
-        logging.exception("Failed to proxy request to backend")
+        logging.exception("[req=%s] Failed to proxy request to backend", req_id)
         return web.json_response(
             {"error": "bad gateway", "detail": str(exc)},
             status=502,
-            headers={"X-Backend": manager.state},
+            headers={"X-Backend": manager.state, "X-Request-ID": req_id},
         )
     finally:
         manager.end_request()
@@ -1045,7 +1058,7 @@ def main() -> int:
             host=config.proxy_host,
             port=config.proxy_port,
             reuse_address=True,
-            access_log_format='%a "%r" %s %b %Dus "%{User-Agent}i"',
+            access_log_format='%a req=%{X-Request-ID}o "%r" %s %b %Dus "%{User-Agent}i"',
         )
     except OSError as e:
         if "address already in use" in str(e).lower():
