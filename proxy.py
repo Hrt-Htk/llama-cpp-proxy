@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,7 @@ class ProxyConfig:
     model_27b: bool
     model_long: bool
     api_key: str
+    chat_log: bool = True
 
     @property
     def backend_base_url(self) -> str:
@@ -88,8 +90,12 @@ class ProxyConfig:
 
     @property
     def server_command(self) -> list[str]:
+        log_file = ROOT / "logs" / f"llama-server-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+        log_file.parent.mkdir(exist_ok=True)
         return [
             str(SERVER_EXE),
+            "--log-file",
+            str(log_file),
             "--model",
             str(self.model_path),
             "--mmproj",
@@ -274,6 +280,7 @@ class ServerManager:
             self.config.model_path.name,
         )
 
+        boot_started = time.monotonic()
         process = await asyncio.create_subprocess_exec(
             *self.config.server_command,
             cwd=str(ROOT),
@@ -286,7 +293,8 @@ class ServerManager:
 
         try:
             await self._wait_until_healthy(process)
-            logging.info("llama-server is ready")
+            boot_ms = int((time.monotonic() - boot_started) * 1000)
+            logging.info("llama-server is ready (boot %dms)", boot_ms)
         except Exception:
             logging.exception("llama-server failed to start")
             await self.stop("boot failure")
@@ -332,6 +340,233 @@ class ServerManager:
                 self.process = None
 
 
+RAW_BODY_CAP = 1024 * 1024  # 1 MB — anything larger is noted but not stored
+
+
+class ChatLogger:
+    """Rotating chat logger — one file per day in the logs/ directory.
+
+    Writes two files per day:
+      - chat-YYYY-MM-DD.log       human-readable transcript
+      - chat-YYYY-MM-DD.raw.jsonl one JSON object per request for replay/debug
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._date: str | None = None
+        self._fh = None
+        self._raw_fh = None
+        self._session_id: str | None = None
+        self._lock = asyncio.Lock()
+        self._open_for_today()
+
+    def _open_for_today(self) -> None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._date == date and self._fh is not None:
+            return
+        if self._fh is not None:
+            self._fh.close()
+        if self._raw_fh is not None:
+            self._raw_fh.close()
+        self.log_file = self.log_dir / f"chat-{date}.log"
+        self.raw_file = self.log_dir / f"chat-{date}.raw.jsonl"
+        self._fh = open(self.log_file, "a", encoding="utf-8")
+        self._raw_fh = open(self.raw_file, "a", encoding="utf-8")
+        self._date = date
+
+    async def log_request(self, method: str, path: str, body: bytes | None) -> None:
+        async with self._lock:
+            self._open_for_today()
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            self._session_id = ts
+            self._fh.write(f"=== [{ts}] {method} {path} ===\n")
+            if body and path.rstrip("/") == "/v1/chat/completions":
+                self._write_latest_user_turn(body)
+            self._fh.flush()
+            self._write_raw(ts, method, path, body)
+
+    def _write_raw(self, ts: str, method: str, path: str, body: bytes | None) -> None:
+        record: dict[str, object] = {"ts": ts, "method": method, "path": path}
+        if body is None:
+            record["body"] = None
+        elif len(body) > RAW_BODY_CAP:
+            record["body"] = None
+            record["body_truncated"] = body[:RAW_BODY_CAP].decode("utf-8", errors="replace")
+            record["original_size"] = len(body)
+        else:
+            try:
+                record["body"] = json.loads(body)
+            except (ValueError, TypeError):
+                record["body_raw"] = body.decode("utf-8", errors="replace")
+        self._raw_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._raw_fh.flush()
+
+    def _write_latest_user_turn(self, body: bytes) -> None:
+        try:
+            payload = json.loads(body)
+        except (ValueError, TypeError):
+            return
+        messages = payload.get("messages") or []
+        if not messages:
+            return
+        last = messages[-1]
+        role = last.get("role")
+        # Skip tool results and prior assistant turns — only log the new user input.
+        if role != "user":
+            return
+        text = _stringify_message_content(last.get("content"))
+        if text:
+            self._fh.write(f"  [user] {text}\n")
+
+    async def log_response(self, data: str, is_done: bool) -> None:
+        async with self._lock:
+            self._open_for_today()
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            if is_done:
+                self._fh.write(f"  [{ts}] [DONE]\n")
+            else:
+                self._fh.write(f"  [{ts}] {data}\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        if self._raw_fh is not None:
+            self._raw_fh.close()
+            self._raw_fh = None
+
+
+def _stringify_message_content(content: object) -> str:
+    """Reduce an OAI message `content` (string or list of parts) to a single line of text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.replace("\n", " ").strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            ctype = item.get("type")
+            if ctype == "text" and item.get("text"):
+                parts.append(str(item["text"]).replace("\n", " ").strip())
+            elif ctype in ("image_url", "image"):
+                parts.append("[image]")
+            elif ctype == "input_audio":
+                parts.append("[audio]")
+        return " ".join(p for p in parts if p)
+    return str(content)
+
+
+class SSEChunkLogger:
+    """Wraps an aiohttp ClientResponse to intercept OAI SSE chunks and log them.
+
+    Accumulates streamed deltas (`choices[0].delta.{content,reasoning_content,tool_calls}`)
+    and flushes one log line per contiguous segment, so the chat log reads like a
+    transcript rather than a per-token dump.
+    """
+
+    def __init__(self, wrapped, chat_logger: ChatLogger) -> None:
+        self._wrapped = wrapped
+        self._chat_logger = chat_logger
+        self._buffer = b""
+        self._current_kind: str | None = None  # "content" or "thinking"
+        self._current_text = ""
+        self._tool_calls: dict[int, dict[str, str]] = {}
+
+    async def _flush_text(self) -> None:
+        if self._current_kind and self._current_text:
+            await self._chat_logger.log_response(
+                f"[{self._current_kind}] {self._current_text.strip()}", False
+            )
+        self._current_kind = None
+        self._current_text = ""
+
+    async def _flush_tool_calls(self) -> None:
+        if not self._tool_calls:
+            return
+        for idx in sorted(self._tool_calls):
+            tc = self._tool_calls[idx]
+            name = tc.get("name") or "?"
+            args = tc.get("arguments") or ""
+            await self._chat_logger.log_response(f"[tool_call] {name}({args})", False)
+        self._tool_calls = {}
+
+    async def _flush_all(self) -> None:
+        await self._flush_text()
+        await self._flush_tool_calls()
+
+    async def readany(self) -> bytes:
+        data = await self._wrapped.content.readany()
+        if not data:
+            await self._flush_all()
+            return data
+        self._buffer += data
+        while True:
+            crlf_idx = self._buffer.find(b"\r\n\r\n")
+            lf_idx = self._buffer.find(b"\n\n")
+            if crlf_idx == -1 and lf_idx == -1:
+                break
+            if crlf_idx != -1 and (lf_idx == -1 or crlf_idx <= lf_idx):
+                idx, sep_len = crlf_idx, 4
+            else:
+                idx, sep_len = lf_idx, 2
+            event = self._buffer[:idx]
+            self._buffer = self._buffer[idx + sep_len:]
+            text = event.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            payload = ""
+            for line in text.splitlines():
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                await self._flush_all()
+                await self._chat_logger.log_response("[DONE]", True)
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+
+            reasoning = delta.get("reasoning_content")
+            content = delta.get("content")
+            tool_calls = delta.get("tool_calls")
+
+            if reasoning:
+                if self._current_kind != "thinking":
+                    await self._flush_all()
+                    self._current_kind = "thinking"
+                self._current_text += reasoning
+            if content:
+                if self._current_kind != "content":
+                    await self._flush_all()
+                    self._current_kind = "content"
+                self._current_text += content
+            if tool_calls:
+                await self._flush_text()
+                for tc in tool_calls:
+                    i = tc.get("index", 0)
+                    slot = self._tool_calls.setdefault(i, {"name": "", "arguments": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+        return data
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wrapped, name)
+
+
 def configure_logging() -> None:
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -368,6 +603,7 @@ def build_config() -> ProxyConfig:
     parser.add_argument("--health-poll-interval", type=float, default=HEALTH_POLL_INTERVAL)
     parser.add_argument("--boot-timeout", type=int, default=BOOT_TIMEOUT)
     parser.add_argument("--api-key", default=API_KEY)
+    parser.add_argument("--no-chat-log", action="store_true", help="Disable chat logging")
     args = parser.parse_args()
 
     if args.q4 and args.model_27b:
@@ -388,6 +624,7 @@ def build_config() -> ProxyConfig:
         model_27b=args.model_27b,
         model_long=args.long,
         api_key=args.api_key,
+        chat_log=not args.no_chat_log,
     )
 
 
@@ -570,6 +807,7 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     session: ClientSession = request.app["session"]
 
     manager.begin_request()
+    chat_logger: ChatLogger | None = request.app.get("chat_logger")
     try:
         body = await request.read() if request.can_read_body else None
         body = _inject_cache_prompt(body, request.method, request.path)
@@ -586,54 +824,68 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             },
         )
 
+    if chat_logger is not None:
+        await chat_logger.log_request(request.method, request.path, body)
+
     target_url = f"{manager.config.backend_base_url}{request.rel_url}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
 
+    upstream_resp = None
     try:
-        async with session.request(
+        upstream_resp = await session.request(
             request.method,
             target_url,
             headers=headers,
             data=body,
             allow_redirects=False,
             timeout=None,
-        ) as upstream:
-            response_headers = filter_response_headers(upstream.headers)
-            response_headers["X-Backend"] = "online"
+        )
 
-            downstream = web.StreamResponse(
-                status=upstream.status,
-                reason=upstream.reason,
-                headers=response_headers,
-            )
-            await downstream.prepare(request)
+        response_headers = filter_response_headers(upstream_resp.headers)
+        response_headers["X-Backend"] = "online"
 
-            try:
-                is_sse = "text/event-stream" in upstream.headers.get("Content-Type", "")
-                if is_sse:
-                    # Poll with timeout so we can inject keep-alives during silent prefill phases
-                    # (the async-for approach only fires when chunks arrive, missing the gap)
-                    KEEPALIVE_INTERVAL = 25
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(
-                                upstream.content.readany(), timeout=KEEPALIVE_INTERVAL
-                            )
-                        except asyncio.TimeoutError:
-                            # No data for 25s — send SSE comment to reset Cloudflare's 100s edge timer
-                            await downstream.write(b": keep-alive\n\n")
-                            continue
-                        if not chunk:
-                            break
-                        await downstream.write(chunk)
-                else:
-                    async for chunk in upstream.content.iter_any():
-                        await downstream.write(chunk)
-            except ConnectionResetError:
-                logging.info("Client disconnected while streaming %s %s", request.method, request.rel_url)
-            finally:
-                with contextlib.suppress(ConnectionResetError, RuntimeError):
-                    await downstream.write_eof()
+        downstream = web.StreamResponse(
+            status=upstream_resp.status,
+            reason=upstream_resp.reason,
+            headers=response_headers,
+        )
+        await downstream.prepare(request)
+
+        try:
+            is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
+            if is_sse and chat_logger:
+                wrapped = SSEChunkLogger(upstream_resp, chat_logger)
+                KEEPALIVE_INTERVAL = 25
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(wrapped.readany(), timeout=KEEPALIVE_INTERVAL)
+                    except asyncio.TimeoutError:
+                        await downstream.write(b": keep-alive\n\n")
+                        continue
+                    if not chunk:
+                        break
+                    await downstream.write(chunk)
+            elif is_sse:
+                KEEPALIVE_INTERVAL = 25
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            upstream_resp.content.readany(), timeout=KEEPALIVE_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        await downstream.write(b": keep-alive\n\n")
+                        continue
+                    if not chunk:
+                        break
+                    await downstream.write(chunk)
+            else:
+                async for chunk in upstream_resp.content.iter_any():
+                    await downstream.write(chunk)
+        except ConnectionResetError:
+            logging.info("Client disconnected while streaming %s %s", request.method, request.rel_url)
+        finally:
+            with contextlib.suppress(ConnectionResetError, RuntimeError):
+                await downstream.write_eof()
 
             return downstream
     except ClientError as exc:
@@ -728,9 +980,11 @@ async def lifecycle_context(app: web.Application):
     session = ClientSession(timeout=ClientTimeout(total=None))
     manager = ServerManager(app["config"], session)
     watchdog_task = asyncio.create_task(idle_watchdog(manager))
+    chat_logger = ChatLogger(ROOT / "logs") if app["config"].chat_log else None
 
     app["session"] = session
     app["manager"] = manager
+    app["chat_logger"] = chat_logger
 
     try:
         yield
@@ -744,6 +998,8 @@ async def lifecycle_context(app: web.Application):
                 await manager._process_watch_task
         with contextlib.suppress(Exception):
             await session.close()
+        if chat_logger is not None:
+            chat_logger.close()
 
 
 async def idle_watchdog(manager: ServerManager) -> None:
@@ -789,6 +1045,7 @@ def main() -> int:
             host=config.proxy_host,
             port=config.proxy_port,
             reuse_address=True,
+            access_log_format='%a "%r" %s %b %Dus "%{User-Agent}i"',
         )
     except OSError as e:
         if "address already in use" in str(e).lower():

@@ -13,7 +13,17 @@ if ($long) {
 }
 
 
+# Ensure log directory exists
+$logDir = "H:\llama.cpp\logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+
+$timestamp = Get-Date -Format "yyyy-MM-dd"
+$logFile = Join-Path $logDir "llama-server-launch-$timestamp.log"
+
+Write-Host "Logging to $logFile"
+
 & "H:\llama.cpp\llama.cpp_setup\llama-server.exe" `
+  --log-file $logFile `
   --model "H:\llama.cpp\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf" `
   --mmproj "H:\llama.cpp\models\mmproj-F16.gguf" `
   --alias "qwen3.6-35b-a3b" `
