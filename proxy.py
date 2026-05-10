@@ -24,31 +24,37 @@ ROOT = Path(__file__).resolve().parent
 SERVER_EXE = ROOT / "llama.cpp_latest" / "llama-server.exe"
 PRESET_PATH = ROOT / "models-preset.ini"
 
-# The router preset section is always named this so pi's hardcoded
-# "qwen3.6-35b-a3b" model field works no matter which weights are loaded.
-PRESET_ALIAS = "qwen3.6-35b-a3b"
-
-
+# Each (model, ctx) pair becomes its own preset section so the router
+# exposes them as distinct models that the pi-llama-cpp extension can
+# discover and switch between — pi treats ctx changes as model switches,
+# which forces a router reload with the new ctx-size baked in.
 @dataclass(frozen=True)
 class ModelChoice:
     label: str          # menu display
+    base_id: str        # e.g. "qwen3.6-35b-q3" — ctx suffix appended at render time
     model_file: Path    # GGUF weights
     mmproj_file: Path   # multimodal projector
+
+    def preset_id(self, ctx: int) -> str:
+        return f"{self.base_id}-{ctx // 1024}k"
 
 
 MODELS: list[ModelChoice] = [
     ModelChoice(
         "Qwen3.6-35B-A3B Q3",
+        "qwen3.6-35b-q3",
         ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         ROOT / "models" / "_aux" / "mmproj-F16.gguf",
     ),
     ModelChoice(
         "Qwen3.6-35B-A3B Q4",
+        "qwen3.6-35b-q4",
         ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
         ROOT / "models" / "_aux" / "mmproj-F16.gguf",
     ),
     ModelChoice(
         "Qwen3.6-27B Q4",
+        "qwen3.6-27b-q4",
         ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.gguf",
         ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
     ),
@@ -197,6 +203,13 @@ class ModelManager:
         async with self._load_lock:
             if self._loaded == model:
                 return
+            # The router may already have the model loaded (e.g. a client called
+            # /models/load directly through the proxy). Sync state before issuing
+            # another load — otherwise the router returns 400 "already running".
+            current_status = await self._status(model)
+            if current_status == "loaded":
+                self._loaded = model
+                return
             logging.info("Loading model: %s", model)
             url = f"{self.config.backend_base_url}/models/load"
             headers = {
@@ -206,6 +219,9 @@ class ModelManager:
             async with self.session.post(url, headers=headers, json={"model": model}) as r:
                 if r.status >= 400:
                     body = await r.text()
+                    if "already running" in body:
+                        self._loaded = model
+                        return
                     raise RuntimeError(f"load returned {r.status}: {body}")
             deadline = time.monotonic() + LOAD_TIMEOUT
             while time.monotonic() < deadline:
@@ -482,76 +498,30 @@ def configure_logging() -> None:
     logging.info("Log file: %s", log_file)
 
 
-def _arrow_picker(prompt: str, choices: list[tuple[str, object]]) -> object:
-    """Arrow-key menu. choices = [(label, value), ...] → returns the chosen value."""
-    import msvcrt  # Windows-only stdlib
-    idx = 0
-    height = len(choices) + 4
-    sys.stdout.write(f"\n{prompt}\n\n")
-    sys.stdout.write("\n" * (height - 2))
-    sys.stdout.flush()
-    try:
-        while True:
-            sys.stdout.write(f"\x1b[{height - 2}A")
-            for i, (label, _) in enumerate(choices):
-                marker = ">" if i == idx else " "
-                sys.stdout.write(f"\x1b[2K  {marker} {label}\n")
-            sys.stdout.write("\x1b[2K\n")
-            sys.stdout.write("\x1b[2K[Up/Down] move  [Enter] select  [q] quit\n")
-            sys.stdout.flush()
-            ch = msvcrt.getch()
-            if ch in (b"\xe0", b"\x00"):
-                ch2 = msvcrt.getch()
-                if ch2 == b"H":
-                    idx = (idx - 1) % len(choices)
-                elif ch2 == b"P":
-                    idx = (idx + 1) % len(choices)
-            elif ch == b"\r":
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                return choices[idx][1]
-            elif ch in (b"q", b"\x1b", b"\x03"):
-                raise SystemExit("Cancelled.")
-    except KeyboardInterrupt:
-        raise SystemExit("Cancelled.")
+DEFAULT_MODEL: ModelChoice = MODELS[0]
+DEFAULT_CTX: int = CTX_CHOICES[-1]
 
 
 def pick_setup(model_arg: str | None, ctx_arg: int | None) -> tuple[ModelChoice, int]:
-    """Resolve (model, context) from CLI args or interactive menus."""
-    model: ModelChoice | None = None
+    """Resolve (model, context) fallback defaults from CLI args.
+
+    All (model × ctx) combos are exposed as router presets regardless; this
+    only picks which one to use when a client doesn't specify a model.
+    """
+    model = DEFAULT_MODEL
     if model_arg:
-        for m in MODELS:
-            if m.label == model_arg or m.model_file.stem == model_arg:
-                model = m
-                break
-        if model is None:
+        match = next(
+            (m for m in MODELS if m.label == model_arg or m.model_file.stem == model_arg),
+            None,
+        )
+        if match is None:
             labels = ", ".join(m.label for m in MODELS)
             raise SystemExit(f"Unknown model {model_arg!r}; available: {labels}")
+        model = match
 
-    ctx: int | None = ctx_arg
-    if ctx is not None and ctx not in CTX_CHOICES:
-        # Allow any value via flag; just warn it's outside the menu's options.
-        logging.warning("--ctx-size %d is outside menu choices %s", ctx, CTX_CHOICES)
-
-    interactive = (model is None or ctx is None) and sys.stdin.isatty()
-    if model is None:
-        if interactive:
-            model = _arrow_picker(
-                "Pick model:",
-                [(m.label, m) for m in MODELS],
-            )
-        else:
-            model = MODELS[0]
-            print(f"No TTY; defaulting model to: {model.label}", file=sys.stderr)
-    if ctx is None:
-        if interactive:
-            ctx = _arrow_picker(
-                "Pick context size:",
-                [(f"{c // 1024}k  ({c} tokens)", c) for c in CTX_CHOICES],
-            )
-        else:
-            ctx = CTX_CHOICES[0]
-            print(f"No TTY; defaulting context to: {ctx}", file=sys.stderr)
+    ctx = ctx_arg if ctx_arg is not None else DEFAULT_CTX
+    if ctx_arg is not None and ctx_arg not in CTX_CHOICES:
+        logging.warning("--ctx-size %d is outside preset choices %s", ctx_arg, CTX_CHOICES)
 
     for path in (model.model_file, model.mmproj_file):
         if not path.exists():
@@ -559,11 +529,10 @@ def pick_setup(model_arg: str | None, ctx_arg: int | None) -> tuple[ModelChoice,
     return model, ctx
 
 
-def write_preset(model: ModelChoice, ctx: int) -> None:
-    """Generate models-preset.ini for the chosen model + ctx.
-    Section name is fixed (PRESET_ALIAS) so pi's request shape works regardless of which weights were picked."""
-    content = (
-        f"[{PRESET_ALIAS}]\n"
+def _model_preset_section(model: ModelChoice, ctx: int) -> str:
+    """Return the INI section text for a single (model, ctx) pair."""
+    return (
+        f"[{model.preset_id(ctx)}]\n"
         f"model         = {model.model_file.as_posix()}\n"
         f"mmproj        = {model.mmproj_file.as_posix()}\n"
         f"ctx-size      = {ctx}\n"
@@ -578,6 +547,21 @@ def write_preset(model: ModelChoice, ctx: int) -> None:
         f"top-p         = 0.95\n"
         f"top-k         = 20\n"
     )
+
+
+def write_preset(models: list[ModelChoice], ctx_choices: list[int]) -> None:
+    """Generate models-preset.ini with every (model, ctx) combination.
+
+    Each combo becomes a distinct preset id (e.g. `qwen3.6-35b-q3-128k`),
+    so picking a different ctx in pi triggers a router reload with the new
+    context size — the only way to "change ctx" without restarting the proxy.
+    """
+    sections = [
+        _model_preset_section(m, ctx)
+        for m in models
+        for ctx in ctx_choices
+    ]
+    content = "\n".join(sections) + "\n"
     PRESET_PATH.write_text(content, encoding="utf-8")
 
 
@@ -603,8 +587,10 @@ def build_config() -> ProxyConfig:
         raise SystemExit(f"Missing required file: {SERVER_EXE}")
 
     model, ctx = pick_setup(args.model, args.ctx_size)
-    write_preset(model, ctx)
-    print(f"Loading: {model.label} @ {ctx // 1024}k ctx (alias: {PRESET_ALIAS})")
+    write_preset(MODELS, CTX_CHOICES)
+    default_id = model.preset_id(ctx)
+    print(f"Default: {model.label} @ {ctx // 1024}k ctx (id: {default_id})")
+    print(f"Exposed presets: {len(MODELS) * len(CTX_CHOICES)} (one per model×ctx combo)")
 
     return ProxyConfig(
         proxy_host=args.proxy_host,
@@ -615,7 +601,7 @@ def build_config() -> ProxyConfig:
         idle_check_interval=args.idle_check_interval,
         health_poll_interval=args.health_poll_interval,
         boot_timeout=args.boot_timeout,
-        default_model=PRESET_ALIAS,
+        default_model=default_id,
         api_key=args.api_key,
         chat_log=not args.no_chat_log,
     )
@@ -759,6 +745,64 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         manager.end_request()
 
 
+async def models_handler(request: web.Request) -> web.Response:
+    """Normalize the router's /models payload so clients see a sane status.
+
+    llama.cpp's router keeps `status.failed = true` (with a stale `exit_code`)
+    on presets that have never had a successful load in the current process —
+    a residual diagnostic flag rather than a real "this model is broken"
+    signal. Newer pi-llama-cpp versions short-circuit to FAILED when they
+    see `failed: true`, so a freshly-booted router shows every preset as
+    "Retry" in pi. We rewrite the flag to false whenever `value` says the
+    preset is simply unloaded — `value` is the source of truth.
+    """
+    manager: ModelManager = request.app["manager"]
+    session: ClientSession = request.app["session"]
+    target_url = f"{manager.config.backend_base_url}{request.rel_url}"
+    headers = filter_request_headers(request.headers, manager.config.api_key)
+    async with session.get(target_url, headers=headers) as upstream:
+        body_text = await upstream.text()
+        try:
+            payload = json.loads(body_text)
+        except (ValueError, TypeError):
+            return web.Response(status=upstream.status, body=body_text,
+                                content_type=upstream.headers.get("Content-Type", "application/json"))
+        for entry in payload.get("data") or []:
+            status = entry.get("status")
+            if isinstance(status, dict) and status.get("value") == "unloaded":
+                status["failed"] = False
+                status.pop("exit_code", None)
+        return web.json_response(payload, status=upstream.status)
+
+
+async def props_handler(request: web.Request) -> web.Response:
+    """Normalize the router's /props response for unloaded models.
+
+    llama.cpp returns HTTP 400 with `{"error":{"code":400,"message":"model is
+    not loaded",...}}` when /props is asked about a non-loaded preset. The
+    pi-llama-cpp extension probes /props as a sanity check after seeing a
+    model in /models with status "unloaded", and a strict reading of its
+    parser can mis-classify that 400 response as FAILED (shows "Retry"
+    instead of "Load & switch"). We rewrite to a clean 200 JSON whose
+    shape matches the exact equality checks in baseModel.getStatus().
+    """
+    manager: ModelManager = request.app["manager"]
+    session: ClientSession = request.app["session"]
+    target_url = f"{manager.config.backend_base_url}{request.rel_url}"
+    headers = filter_request_headers(request.headers, manager.config.api_key)
+    async with session.get(target_url, headers=headers) as upstream:
+        body_text = await upstream.text()
+        if upstream.status == 400 and "model is not loaded" in body_text:
+            return web.json_response(
+                {"error": {"code": 400, "message": "model is not loaded"}}
+            )
+        return web.Response(
+            status=upstream.status,
+            body=body_text,
+            content_type=upstream.headers.get("Content-Type", "application/json"),
+        )
+
+
 async def health_handler(request: web.Request) -> web.Response:
     manager: ModelManager = request.app["manager"]
     return web.json_response({
@@ -808,6 +852,8 @@ def build_app(config: ProxyConfig) -> web.Application:
     app["config"] = config
     app.cleanup_ctx.append(lifecycle_context)
     app.router.add_route("GET", "/health", health_handler)
+    app.router.add_route("GET", "/models", models_handler)
+    app.router.add_route("GET", "/props", props_handler)
     app.router.add_route("*", "/{tail:.*}", proxy_request)
     return app
 

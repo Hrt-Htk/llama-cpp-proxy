@@ -1,9 +1,11 @@
 # Supervisor for proxy.py — restarts the proxy if it crashes.
 # Usage: .\watchdog.ps1 [extra args forwarded to proxy.py]
 # Examples:
-#   .\watchdog.ps1                                            # interactive: pick model + ctx
-#   .\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768  # headless
+#   .\watchdog.ps1                                            # uses defaults
+#   .\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768  # override default fallback
 #   .\watchdog.ps1 --idle-timeout 600                         # production idle window
+# All (model x ctx) combos are exposed as router presets regardless;
+# --model and --ctx-size only set the fallback when a client omits the model.
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path $PSCommandPath -Parent
