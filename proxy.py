@@ -7,31 +7,64 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
-import re
 import secrets
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
+# Enable ANSI escape sequences on Windows 10+
+if sys.platform == "win32":
+    os.system("")
+
 
 ROOT = Path(__file__).resolve().parent
-SERVER_EXE = ROOT / "llama.cpp_setup" / "llama-server.exe"
-MMPROJ_35B_PATH = ROOT / "models" / "mmproj-F16.gguf"
-MMPROJ_27B_PATH = ROOT / "models" / "mmproj-27b-BF16.gguf"
-MODEL_Q3_PATH = ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
-MODEL_Q4_PATH = ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-MODEL_27B_PATH = ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
+SERVER_EXE = ROOT / "llama.cpp_latest" / "llama-server.exe"
+PRESET_PATH = ROOT / "models-preset.ini"
+
+# The router preset section is always named this so pi's hardcoded
+# "qwen3.6-35b-a3b" model field works no matter which weights are loaded.
+PRESET_ALIAS = "qwen3.6-35b-a3b"
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    label: str          # menu display
+    model_file: Path    # GGUF weights
+    mmproj_file: Path   # multimodal projector
+
+
+MODELS: list[ModelChoice] = [
+    ModelChoice(
+        "Qwen3.6-35B-A3B Q3",
+        ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+        ROOT / "models" / "_aux" / "mmproj-F16.gguf",
+    ),
+    ModelChoice(
+        "Qwen3.6-35B-A3B Q4",
+        ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        ROOT / "models" / "_aux" / "mmproj-F16.gguf",
+    ),
+    ModelChoice(
+        "Qwen3.6-27B Q4",
+        ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+        ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
+    ),
+]
+
+CTX_CHOICES: list[int] = [32768, 65536, 131072]
 
 PROXY_HOST = "::"
 PROXY_PORT = 8001
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8002
-IDLE_TIMEOUT = 600
-IDLE_CHECK_INTERVAL = 60
+IDLE_TIMEOUT = 600  # 10 minutes of inactivity before unload
+IDLE_CHECK_INTERVAL = 30  # check every 30s
 HEALTH_POLL_INTERVAL = 1.0
-BOOT_TIMEOUT = 120
+BOOT_TIMEOUT = 60
+LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
 API_KEY = os.environ.get("LLAMA_API_KEY", "rRZsSjRvaUuRMr5AeDA14rO9jaSlhSRhRtBI5ZlO")
 
@@ -57,9 +90,7 @@ class ProxyConfig:
     idle_check_interval: int
     health_poll_interval: float
     boot_timeout: int
-    model_q4: bool
-    model_27b: bool
-    model_long: bool
+    default_model: str
     api_key: str
     chat_log: bool = True
 
@@ -68,289 +99,170 @@ class ProxyConfig:
         return f"http://{self.server_host}:{self.server_port}"
 
     @property
-    def model_path(self) -> Path:
-        if self.model_27b:
-            return MODEL_27B_PATH
-        return MODEL_Q4_PATH if self.model_q4 else MODEL_Q3_PATH
-
-    @property
-    def mmproj_path(self) -> Path:
-        if self.model_27b:
-            return MMPROJ_27B_PATH
-        return MMPROJ_35B_PATH
-
-    @property
-    def alias(self) -> str:
-        if self.model_27b:
-            return "qwen3.6-27b"
-        return "qwen3.6-35b-a3b-q4" if self.model_q4 else "qwen3.6-35b-a3b"
-
-    @property
-    def context_size(self) -> int:
-        return 262144 if self.model_long else 131072
-
-    @property
     def server_command(self) -> list[str]:
         log_file = ROOT / "logs" / f"llama-server-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
         log_file.parent.mkdir(exist_ok=True)
         return [
             str(SERVER_EXE),
-            "--log-file",
-            str(log_file),
-            "--model",
-            str(self.model_path),
-            "--mmproj",
-            str(self.mmproj_path),
-            "--alias",
-            self.alias,
-            "-ngl",
-            "999",
-            "--no-mmap",
-            "-fa",
-            "on",
-            "--cache-type-k",
-            "q4_0",
-            "--cache-type-v",
-            "q4_0",
-            "-b",
-            "8192",
-            "-ub",
-            "2048",
-            "-c",
-            str(self.context_size),
-            "--parallel",
-            "1",
-            "--jinja",
-            "--temp",
-            "0.6",
-            "--top-p",
-            "0.95",
-            "--top-k",
-            "20",
-            "--min-p",
-            "0.0",
-            "--presence-penalty",
-            "0.0",
-            "--port",
-            str(self.server_port),
-            "--host",
-            self.server_host,
-            "--api-key",
-            self.api_key,
+            "--log-file", str(log_file),
+            "--models-preset", str(PRESET_PATH),
+            "--models-max", "1",
+            "--no-models-autoload",
+            "--host", self.server_host,
+            "--port", str(self.server_port),
+            "--api-key", self.api_key,
         ]
 
 
-class ServerManager:
+class ModelManager:
+    """Owns the long-lived router process and on-demand model load/unload.
+
+    The router process starts with the proxy and dies with it. Models are
+    loaded on first request and unloaded by the idle watchdog — the router
+    itself stays up so the cloudflared tunnel never breaks.
+    """
+
     def __init__(self, config: ProxyConfig, session: ClientSession) -> None:
         self.config = config
         self.session = session
         self.process: asyncio.subprocess.Process | None = None
-        self._process_watch_task: asyncio.Task[None] | None = None
-        self._boot_task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
-        self._active_requests = 0
+        self._loaded: str | None = None  # alias of currently-loaded model, None if nothing
+        self._load_lock = asyncio.Lock()
+        self._active = 0
         self._last_activity = time.monotonic()
-        self._adopted = False  # True if we adopted an existing server (no process handle)
 
     @property
-    def state(self) -> str:
-        if self._boot_task is not None and not self._boot_task.done():
-            return "booting"
-        if self._adopted:
-            return "running"
-        if self.process is not None and self.process.returncode is None:
-            return "running"
-        return "offline"
+    def server_running(self) -> bool:
+        return self.process is not None and self.process.returncode is None
+
+    @property
+    def model_loaded(self) -> str | None:
+        return self._loaded
 
     @property
     def active_requests(self) -> int:
-        return self._active_requests
+        return self._active
 
     def begin_request(self) -> None:
-        self._active_requests += 1
+        self._active += 1
         self._last_activity = time.monotonic()
 
     def end_request(self) -> None:
-        self._active_requests = max(0, self._active_requests - 1)
+        self._active = max(0, self._active - 1)
         self._last_activity = time.monotonic()
 
-    async def ensure_running(self) -> None:
-        boot_task: asyncio.Task[None] | None = None
-
-        async with self._lock:
-            if self._adopted:
-                # Already adopted an existing server, nothing to do
-                return
-            if self.process is not None and self.process.returncode is None:
-                boot_task = self._boot_task
-                if boot_task is None or boot_task.done():
-                    return
-            else:
-                if self._boot_task is None or self._boot_task.done():
-                    self._boot_task = asyncio.create_task(self._start_process())
-                boot_task = self._boot_task
-
-        if boot_task is not None:
-            await boot_task
-
-    async def stop(self, reason: str) -> None:
-        async with self._lock:
-            process = self.process
-            adopted = self._adopted
-
-            if process is None and not adopted:
-                return
-
-            if process is not None and process.returncode is not None:
-                self.process = None
-                self._adopted = False
-                return
-
-            logging.info("Stopping llama-server (%s)", reason)
-
-            if adopted:
-                # We adopted an existing server (from a previous crashed proxy instance)
-                # but have no process handle. We can't kill it cleanly.
-                # Just mark it as gone — it will keep running until manually stopped
-                # or the next proxy instance adopts it again.
-                logging.warning(
-                    "Cannot stop adopted llama-server (no process handle). "
-                    "It will keep running on port %s until manually killed.",
-                    self.config.server_port,
-                )
-                self._adopted = False
-            else:
-                try:
-                    # On Windows, llama-server may not handle terminate() gracefully.
-                    # Try terminate first, then kill if needed.
-                    process.terminate()
-                    try:
-                        await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        process.kill()
-                        await asyncio.wait_for(process.wait(), timeout=5)
-                except ProcessLookupError:
-                    pass  # Already exited
-                finally:
-                    if self.process is process:
-                        self.process = None
-
-    async def stop_if_idle(self) -> None:
-        idle_for = time.monotonic() - self._last_activity
-        should_stop = (
-            self.state == "running"
-            and self._active_requests == 0
-            and idle_for >= self.config.idle_timeout
-        )
-
-        if should_stop:
-            await self.stop(f"idle for {int(idle_for)} seconds")
-
-    async def _check_existing_server(self) -> bool:
-        """Check if llama-server is already running on the target port (e.g. from a crashed proxy).
-        Returns True if a healthy server is found."""
-        health_url = f"{self.config.backend_base_url}/health"
-        try:
-            async with self.session.get(
-                health_url,
-                timeout=ClientTimeout(total=5),
-            ) as response:
-                if response.status == 200:
-                    self._adopted = True
-                    logging.info(
-                        "Found existing llama-server on %s:%s — adopting it",
-                        self.config.server_host,
-                        self.config.server_port,
-                    )
-                    return True
-        except (ClientError, asyncio.TimeoutError):
-            pass
-        return False
-
-    async def _start_process(self) -> None:
-        # Check if llama-server is already running (leftover from a crashed proxy instance)
-        if await self._check_existing_server():
-            async with self._lock:
-                self._last_activity = time.monotonic()
+    async def start_server(self) -> None:
+        if self.server_running:
             return
-
         logging.info(
-            "Starting llama-server on %s:%s with model %s",
-            self.config.server_host,
-            self.config.server_port,
-            self.config.model_path.name,
+            "Starting router on %s:%s", self.config.server_host, self.config.server_port,
         )
-
-        boot_started = time.monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *self.config.server_command,
-            cwd=str(ROOT),
+        self.process = await asyncio.create_subprocess_exec(
+            *self.config.server_command, cwd=str(ROOT),
         )
-
-        async with self._lock:
-            self.process = process
-            self._process_watch_task = asyncio.create_task(self._watch_process(process))
-            self._last_activity = time.monotonic()
-
-        try:
-            await self._wait_until_healthy(process)
-            boot_ms = int((time.monotonic() - boot_started) * 1000)
-            logging.info("llama-server is ready (boot %dms)", boot_ms)
-        except Exception:
-            logging.exception("llama-server failed to start")
-            await self.stop("boot failure")
-            raise
-        finally:
-            async with self._lock:
-                if self._boot_task is asyncio.current_task():
-                    self._boot_task = None
-
-    async def _wait_until_healthy(self, process: asyncio.subprocess.Process) -> None:
         deadline = time.monotonic() + self.config.boot_timeout
-        health_url = f"{self.config.backend_base_url}/health"
-
         while time.monotonic() < deadline:
-            if process.returncode is not None:
-                raise RuntimeError(
-                    f"llama-server exited during boot with code {process.returncode}"
-                )
-
+            if self.process.returncode is not None:
+                raise RuntimeError(f"router exited during boot: {self.process.returncode}")
             try:
                 async with self.session.get(
-                    health_url,
+                    f"{self.config.backend_base_url}/health",
                     timeout=ClientTimeout(total=5),
-                ) as response:
-                    if response.status == 200:
+                ) as r:
+                    if r.status == 200:
+                        logging.info("router is ready")
                         return
             except (ClientError, asyncio.TimeoutError):
                 pass
-
             await asyncio.sleep(self.config.health_poll_interval)
+        raise TimeoutError(f"router did not become healthy in {self.config.boot_timeout}s")
 
-        raise TimeoutError(
-            f"llama-server did not become healthy within {self.config.boot_timeout} seconds"
-        )
+    async def stop_server(self) -> None:
+        if not self.server_running:
+            return
+        logging.info("Stopping router")
+        try:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.process.kill()
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+        except ProcessLookupError:
+            pass
+        self.process = None
+        self._loaded = None
 
-    async def _watch_process(self, process: asyncio.subprocess.Process) -> None:
-        exit_code = await process.wait()
-        level = logging.INFO if exit_code == 0 else logging.WARNING
-        logging.log(level, "llama-server exited with code %s", exit_code)
+    async def ensure_loaded(self, model: str) -> None:
+        async with self._load_lock:
+            if self._loaded == model:
+                return
+            logging.info("Loading model: %s", model)
+            url = f"{self.config.backend_base_url}/models/load"
+            headers = {
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            }
+            async with self.session.post(url, headers=headers, json={"model": model}) as r:
+                if r.status >= 400:
+                    body = await r.text()
+                    raise RuntimeError(f"load returned {r.status}: {body}")
+            deadline = time.monotonic() + LOAD_TIMEOUT
+            while time.monotonic() < deadline:
+                status = await self._status(model)
+                if status == "loaded":
+                    self._loaded = model
+                    logging.info("Model loaded: %s", model)
+                    return
+                if status == "failed":
+                    raise RuntimeError(f"model {model} failed to load")
+                await asyncio.sleep(0.5)
+            raise TimeoutError(f"model {model} did not load in {LOAD_TIMEOUT}s")
 
-        async with self._lock:
-            if self.process is process:
-                self.process = None
+    async def unload(self, reason: str) -> None:
+        if self._loaded is None:
+            return
+        model = self._loaded
+        logging.info("Unloading %s (%s)", model, reason)
+        url = f"{self.config.backend_base_url}/models/unload"
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with self.session.post(url, headers=headers, json={"model": model}) as r:
+                if r.status >= 400:
+                    logging.warning("unload returned %s", r.status)
+        except ClientError as e:
+            logging.warning("unload error: %s", e)
+        self._loaded = None
+
+    async def _status(self, model: str) -> str:
+        url = f"{self.config.backend_base_url}/v1/models"
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        async with self.session.get(url, headers=headers) as r:
+            data = await r.json()
+        for entry in data.get("data", []):
+            if entry.get("id") == model:
+                status = entry.get("status") or {}
+                if isinstance(status, dict):
+                    return status.get("value", "unknown")
+                return str(status)
+        return "unknown"
+
+    async def unload_if_idle(self) -> None:
+        if self._active != 0 or self._loaded is None:
+            return
+        idle = time.monotonic() - self._last_activity
+        if idle >= self.config.idle_timeout:
+            await self.unload(f"idle for {int(idle)}s")
 
 
-RAW_BODY_CAP = 1024 * 1024  # 1 MB — anything larger is noted but not stored
+RAW_BODY_CAP = 1024 * 1024
 
 
 class ChatLogger:
-    """Rotating chat logger — one file per day in the logs/ directory.
-
-    Writes two files per day:
-      - chat-YYYY-MM-DD.log       human-readable transcript
-      - chat-YYYY-MM-DD.raw.jsonl one JSON object per request for replay/debug
-    """
+    """Rotating chat logger — one file per day in the logs/ directory."""
 
     def __init__(self, log_dir: Path) -> None:
         self.log_dir = log_dir
@@ -358,7 +270,6 @@ class ChatLogger:
         self._date: str | None = None
         self._fh = None
         self._raw_fh = None
-        self._session_id: str | None = None
         self._lock = asyncio.Lock()
         self._open_for_today()
 
@@ -380,7 +291,6 @@ class ChatLogger:
         async with self._lock:
             self._open_for_today()
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            self._session_id = ts
             self._fh.write(f"=== [{ts}] [req={req_id}] {method} {path} ===\n")
             if body and path.rstrip("/") == "/v1/chat/completions":
                 self._write_latest_user_turn(body)
@@ -412,9 +322,7 @@ class ChatLogger:
         if not messages:
             return
         last = messages[-1]
-        role = last.get("role")
-        # Skip tool results and prior assistant turns — only log the new user input.
-        if role != "user":
+        if last.get("role") != "user":
             return
         text = _stringify_message_content(last.get("content"))
         if text:
@@ -440,7 +348,6 @@ class ChatLogger:
 
 
 def _stringify_message_content(content: object) -> str:
-    """Reduce an OAI message `content` (string or list of parts) to a single line of text."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -462,18 +369,11 @@ def _stringify_message_content(content: object) -> str:
 
 
 class SSEChunkLogger:
-    """Wraps an aiohttp ClientResponse to intercept OAI SSE chunks and log them.
-
-    Accumulates streamed deltas (`choices[0].delta.{content,reasoning_content,tool_calls}`)
-    and flushes one log line per contiguous segment, so the chat log reads like a
-    transcript rather than a per-token dump.
-    """
-
     def __init__(self, wrapped, chat_logger: ChatLogger) -> None:
         self._wrapped = wrapped
         self._chat_logger = chat_logger
         self._buffer = b""
-        self._current_kind: str | None = None  # "content" or "thinking"
+        self._current_kind: str | None = None
         self._current_text = ""
         self._tool_calls: dict[int, dict[str, str]] = {}
 
@@ -537,11 +437,9 @@ class SSEChunkLogger:
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
-
             reasoning = delta.get("reasoning_content")
             content = delta.get("content")
             tool_calls = delta.get("tool_calls")
-
             if reasoning:
                 if self._current_kind != "thinking":
                     await self._flush_all()
@@ -572,49 +470,141 @@ def configure_logging() -> None:
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d.log")
-
-    # Force every log handler (and aiohttp's access logger) onto UTC so timestamps
-    # line up with the chat log, which is already UTC.
     logging.Formatter.converter = time.gmtime
-
     fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
-
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
-
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(fmt)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[console, file_handler],
-    )
+    logging.basicConfig(level=logging.INFO, handlers=[console, file_handler])
     logging.info("Log file: %s", log_file)
 
 
+def _arrow_picker(prompt: str, choices: list[tuple[str, object]]) -> object:
+    """Arrow-key menu. choices = [(label, value), ...] → returns the chosen value."""
+    import msvcrt  # Windows-only stdlib
+    idx = 0
+    height = len(choices) + 4
+    sys.stdout.write(f"\n{prompt}\n\n")
+    sys.stdout.write("\n" * (height - 2))
+    sys.stdout.flush()
+    try:
+        while True:
+            sys.stdout.write(f"\x1b[{height - 2}A")
+            for i, (label, _) in enumerate(choices):
+                marker = ">" if i == idx else " "
+                sys.stdout.write(f"\x1b[2K  {marker} {label}\n")
+            sys.stdout.write("\x1b[2K\n")
+            sys.stdout.write("\x1b[2K[Up/Down] move  [Enter] select  [q] quit\n")
+            sys.stdout.flush()
+            ch = msvcrt.getch()
+            if ch in (b"\xe0", b"\x00"):
+                ch2 = msvcrt.getch()
+                if ch2 == b"H":
+                    idx = (idx - 1) % len(choices)
+                elif ch2 == b"P":
+                    idx = (idx + 1) % len(choices)
+            elif ch == b"\r":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return choices[idx][1]
+            elif ch in (b"q", b"\x1b", b"\x03"):
+                raise SystemExit("Cancelled.")
+    except KeyboardInterrupt:
+        raise SystemExit("Cancelled.")
+
+
+def pick_setup(model_arg: str | None, ctx_arg: int | None) -> tuple[ModelChoice, int]:
+    """Resolve (model, context) from CLI args or interactive menus."""
+    model: ModelChoice | None = None
+    if model_arg:
+        for m in MODELS:
+            if m.label == model_arg or m.model_file.stem == model_arg:
+                model = m
+                break
+        if model is None:
+            labels = ", ".join(m.label for m in MODELS)
+            raise SystemExit(f"Unknown model {model_arg!r}; available: {labels}")
+
+    ctx: int | None = ctx_arg
+    if ctx is not None and ctx not in CTX_CHOICES:
+        # Allow any value via flag; just warn it's outside the menu's options.
+        logging.warning("--ctx-size %d is outside menu choices %s", ctx, CTX_CHOICES)
+
+    interactive = (model is None or ctx is None) and sys.stdin.isatty()
+    if model is None:
+        if interactive:
+            model = _arrow_picker(
+                "Pick model:",
+                [(m.label, m) for m in MODELS],
+            )
+        else:
+            model = MODELS[0]
+            print(f"No TTY; defaulting model to: {model.label}", file=sys.stderr)
+    if ctx is None:
+        if interactive:
+            ctx = _arrow_picker(
+                "Pick context size:",
+                [(f"{c // 1024}k  ({c} tokens)", c) for c in CTX_CHOICES],
+            )
+        else:
+            ctx = CTX_CHOICES[0]
+            print(f"No TTY; defaulting context to: {ctx}", file=sys.stderr)
+
+    for path in (model.model_file, model.mmproj_file):
+        if not path.exists():
+            raise SystemExit(f"Missing file for {model.label}: {path}")
+    return model, ctx
+
+
+def write_preset(model: ModelChoice, ctx: int) -> None:
+    """Generate models-preset.ini for the chosen model + ctx.
+    Section name is fixed (PRESET_ALIAS) so pi's request shape works regardless of which weights were picked."""
+    content = (
+        f"[{PRESET_ALIAS}]\n"
+        f"model         = {model.model_file.as_posix()}\n"
+        f"mmproj        = {model.mmproj_file.as_posix()}\n"
+        f"ctx-size      = {ctx}\n"
+        f"n-gpu-layers  = 999\n"
+        f"flash-attn    = on\n"
+        f"cache-type-k  = q4_0\n"
+        f"cache-type-v  = q4_0\n"
+        f"no-mmap       = 1\n"
+        f"parallel      = 1\n"
+        f"jinja         = 1\n"
+        f"temp          = 0.6\n"
+        f"top-p         = 0.95\n"
+        f"top-k         = 20\n"
+    )
+    PRESET_PATH.write_text(content, encoding="utf-8")
+
+
 def build_config() -> ProxyConfig:
-    parser = argparse.ArgumentParser(description="Wake-on-demand proxy for llama-server")
-    parser.add_argument("--q4", action="store_true", help="Use the Q4 model (35B-A3B)")
-    parser.add_argument("--27b", dest="model_27b", action="store_true", help="Use the Qwen3.6-27B model")
-    parser.add_argument("--long", action="store_true", help="Use the 256k context window")
-    parser.add_argument("--proxy-host", default=PROXY_HOST)
-    parser.add_argument("--proxy-port", type=int, default=PROXY_PORT)
-    parser.add_argument("--server-host", default=SERVER_HOST)
-    parser.add_argument("--server-port", type=int, default=SERVER_PORT)
-    parser.add_argument("--idle-timeout", type=int, default=IDLE_TIMEOUT)
-    parser.add_argument("--idle-check-interval", type=int, default=IDLE_CHECK_INTERVAL)
-    parser.add_argument("--health-poll-interval", type=float, default=HEALTH_POLL_INTERVAL)
-    parser.add_argument("--boot-timeout", type=int, default=BOOT_TIMEOUT)
-    parser.add_argument("--api-key", default=API_KEY)
-    parser.add_argument("--no-chat-log", action="store_true", help="Disable chat logging")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Router-mode proxy for llama-server")
+    p.add_argument("--proxy-host", default=PROXY_HOST)
+    p.add_argument("--proxy-port", type=int, default=PROXY_PORT)
+    p.add_argument("--server-host", default=SERVER_HOST)
+    p.add_argument("--server-port", type=int, default=SERVER_PORT)
+    p.add_argument("--idle-timeout", type=int, default=IDLE_TIMEOUT)
+    p.add_argument("--idle-check-interval", type=int, default=IDLE_CHECK_INTERVAL)
+    p.add_argument("--health-poll-interval", type=float, default=HEALTH_POLL_INTERVAL)
+    p.add_argument("--boot-timeout", type=int, default=BOOT_TIMEOUT)
+    p.add_argument("--model", default=None,
+                   help="Skip the model picker (use exact label from MODELS)")
+    p.add_argument("--ctx-size", type=int, default=None,
+                   help="Skip the context picker (any int; menu offers 32k/64k/128k)")
+    p.add_argument("--api-key", default=API_KEY)
+    p.add_argument("--no-chat-log", action="store_true")
+    args = p.parse_args()
 
-    if args.q4 and args.model_27b:
-        raise SystemExit("Cannot use --q4 and --27b together. Pick one.")
+    if not SERVER_EXE.exists():
+        raise SystemExit(f"Missing required file: {SERVER_EXE}")
 
-    validate_paths(args.q4, args.model_27b)
+    model, ctx = pick_setup(args.model, args.ctx_size)
+    write_preset(model, ctx)
+    print(f"Loading: {model.label} @ {ctx // 1024}k ctx (alias: {PRESET_ALIAS})")
 
     return ProxyConfig(
         proxy_host=args.proxy_host,
@@ -625,41 +615,25 @@ def build_config() -> ProxyConfig:
         idle_check_interval=args.idle_check_interval,
         health_poll_interval=args.health_poll_interval,
         boot_timeout=args.boot_timeout,
-        model_q4=args.q4,
-        model_27b=args.model_27b,
-        model_long=args.long,
+        default_model=PRESET_ALIAS,
         api_key=args.api_key,
         chat_log=not args.no_chat_log,
     )
 
 
-def validate_paths(use_q4: bool, use_27b: bool) -> None:
-    required_paths = [SERVER_EXE]
-    if use_27b:
-        required_paths.extend([MMPROJ_27B_PATH, MODEL_27B_PATH])
-    else:
-        required_paths.extend([MMPROJ_35B_PATH, MODEL_Q4_PATH if use_q4 else MODEL_Q3_PATH])
-
-    missing = [str(path) for path in required_paths if not path.exists()]
-    if missing:
-        raise SystemExit(f"Missing required files: {', '.join(missing)}")
-
-
-def filter_request_headers(headers: web.BaseRequest.headers.__class__, api_key: str) -> dict[str, str]:
+def filter_request_headers(headers, api_key: str) -> dict[str, str]:
     forwarded: dict[str, str] = {}
     for name, value in headers.items():
         lowered = name.lower()
-        if lowered == "host" or lowered == "content-length" or lowered in HOP_BY_HOP_HEADERS:
+        if lowered in ("host", "content-length") or lowered in HOP_BY_HOP_HEADERS:
             continue
         forwarded[name] = value
-
     if api_key and "Authorization" not in forwarded:
         forwarded["Authorization"] = f"Bearer {api_key}"
-
     return forwarded
 
 
-def filter_response_headers(headers: web.BaseRequest.headers.__class__) -> dict[str, str]:
+def filter_response_headers(headers) -> dict[str, str]:
     forwarded: dict[str, str] = {}
     for name, value in headers.items():
         lowered = name.lower()
@@ -667,131 +641,6 @@ def filter_response_headers(headers: web.BaseRequest.headers.__class__) -> dict[
             continue
         forwarded[name] = value
     return forwarded
-
-
-def synthetic_status_value(manager: ServerManager) -> str:
-    if manager.state == "running":
-        return "loaded"
-    if manager.state == "booting":
-        return "loading"
-    return "sleeping"
-
-
-def build_model_details(config: ProxyConfig) -> dict[str, object]:
-    model_stat = config.model_path.stat()
-    modified_at = datetime.fromtimestamp(model_stat.st_mtime, tz=timezone.utc).isoformat()
-
-    if config.model_27b:
-        quantization = "Q4_K_XL"
-        parent_model = "Qwen3.6-27B"
-        parameter_size = "27B"
-    else:
-        quantization = "Q4_K_M" if config.model_q4 else "Q3_K_XL"
-        parent_model = "Qwen3.6-35B-A3B"
-        parameter_size = "35B"
-
-    return {
-        "name": config.alias,
-        "model": config.model_path.name,
-        "modified_at": modified_at,
-        "size": str(model_stat.st_size),
-        "digest": "",
-        "type": "model",
-        "description": f"Wake-on-demand proxy for {config.alias}",
-        "tags": [],
-        "capabilities": ["multimodal"],
-        "parameters": str(config.context_size),
-        "details": {
-            "parent_model": parent_model,
-            "format": "gguf",
-            "family": "qwen",
-            "families": ["qwen"],
-            "parameter_size": parameter_size,
-            "quantization_level": quantization,
-        },
-    }
-
-
-def build_models_payload(manager: ServerManager) -> dict[str, object]:
-    config = manager.config
-    model_stat = config.model_path.stat()
-
-    return {
-        "object": "list",
-        "models": [build_model_details(config)],
-        "data": [
-            {
-                "id": config.alias,
-                "aliases": [config.alias],
-                "tags": [],
-                "object": "model",
-                "owned_by": "llama.cpp",
-                "created": int(model_stat.st_mtime),
-                "status": {
-                    "value": synthetic_status_value(manager),
-                    "args": config.server_command[1:],
-                    "preset": "default",
-                },
-                "meta": {
-                    "vocab_type": 0,
-                    "n_vocab": 0,
-                    "n_ctx_train": config.context_size,
-                    "n_embd": 0,
-                    "n_params": 0,
-                    "size": model_stat.st_size,
-                },
-            }
-        ],
-    }
-
-
-def build_openai_models_payload(manager: ServerManager) -> dict[str, object]:
-    config = manager.config
-    model_stat = config.model_path.stat()
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": config.alias,
-                "object": "model",
-                "created": int(model_stat.st_mtime),
-                "owned_by": "llama.cpp",
-            }
-        ],
-    }
-
-
-def build_props_payload(manager: ServerManager) -> dict[str, object]:
-    return {
-        "default_generation_settings": {},
-        "total_slots": 1,
-        "model_alias": manager.config.alias,
-        "model_path": str(manager.config.model_path),
-        "modalities": {"vision": True, "audio": False},
-        "media_marker": "",
-        "endpoint_slots": True,
-        "endpoint_props": True,
-        "endpoint_metrics": False,
-        "webui": False,
-        "webui_settings": {},
-        "chat_template": "",
-        "chat_template_caps": {},
-        "bos_token": "",
-        "eos_token": "",
-        "build_info": "wake-on-demand-proxy",
-        "is_sleeping": manager.state != "running",
-    }
-
-
-def build_slots_payload(manager: ServerManager) -> list[dict[str, object]]:
-    return [
-        {
-            "id": 0,
-            "n_ctx": manager.config.context_size,
-            "speculative": False,
-            "is_processing": manager.active_requests > 0,
-        }
-    ]
 
 
 def _inject_cache_prompt(body: bytes | None, method: str, path: str) -> bytes | None:
@@ -807,29 +656,43 @@ def _inject_cache_prompt(body: bytes | None, method: str, path: str) -> bytes | 
     return body
 
 
+def _model_from_body(body: bytes | None, fallback: str) -> str:
+    if not body:
+        return fallback
+    try:
+        payload = json.loads(body)
+        m = payload.get("model")
+        if isinstance(m, str) and m:
+            return m
+    except (ValueError, TypeError):
+        pass
+    return fallback
+
+
 async def proxy_request(request: web.Request) -> web.StreamResponse:
-    manager: ServerManager = request.app["manager"]
+    manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
+    chat_logger: ChatLogger | None = request.app.get("chat_logger")
 
     req_id = secrets.token_hex(4)
     started = time.monotonic()
     manager.begin_request()
-    chat_logger: ChatLogger | None = request.app.get("chat_logger")
+
     try:
         body = await request.read() if request.can_read_body else None
         body = _inject_cache_prompt(body, request.method, request.path)
-        await manager.ensure_running()
+        # Only ensure-load for endpoints that need a model
+        path = request.path.rstrip("/")
+        if path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
+            model = _model_from_body(body, manager.config.default_model)
+            await manager.ensure_loaded(model)
     except Exception as exc:
-        logging.exception("[req=%s] Backend is unavailable", req_id)
+        logging.exception("[req=%s] backend unavailable", req_id)
         manager.end_request()
         return web.json_response(
             {"error": "backend unavailable", "detail": str(exc)},
             status=503,
-            headers={
-                "Retry-After": str(RETRY_AFTER_SECONDS),
-                "X-Backend": manager.state,
-                "X-Request-ID": req_id,
-            },
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
         )
 
     if chat_logger is not None:
@@ -838,36 +701,24 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     target_url = f"{manager.config.backend_base_url}{request.rel_url}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
 
-    upstream_resp = None
     try:
         upstream_resp = await session.request(
-            request.method,
-            target_url,
-            headers=headers,
-            data=body,
-            allow_redirects=False,
-            timeout=None,
+            request.method, target_url, headers=headers,
+            data=body, allow_redirects=False, timeout=None,
         )
-
         response_headers = filter_response_headers(upstream_resp.headers)
-        response_headers["X-Backend"] = "online"
         response_headers["X-Request-ID"] = req_id
-
         downstream = web.StreamResponse(
-            status=upstream_resp.status,
-            reason=upstream_resp.reason,
-            headers=response_headers,
+            status=upstream_resp.status, reason=upstream_resp.reason, headers=response_headers,
         )
         await downstream.prepare(request)
-
         try:
             is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
             if is_sse and chat_logger:
                 wrapped = SSEChunkLogger(upstream_resp, chat_logger)
-                KEEPALIVE_INTERVAL = 25
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(wrapped.readany(), timeout=KEEPALIVE_INTERVAL)
+                        chunk = await asyncio.wait_for(wrapped.readany(), timeout=25)
                     except asyncio.TimeoutError:
                         await downstream.write(b": keep-alive\n\n")
                         continue
@@ -875,12 +726,9 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                         break
                     await downstream.write(chunk)
             elif is_sse:
-                KEEPALIVE_INTERVAL = 25
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(
-                            upstream_resp.content.readany(), timeout=KEEPALIVE_INTERVAL
-                        )
+                        chunk = await asyncio.wait_for(upstream_resp.content.readany(), timeout=25)
                     except asyncio.TimeoutError:
                         await downstream.write(b": keep-alive\n\n")
                         continue
@@ -891,7 +739,7 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 async for chunk in upstream_resp.content.iter_any():
                     await downstream.write(chunk)
         except ConnectionResetError:
-            logging.info("[req=%s] Client disconnected while streaming %s %s", req_id, request.method, request.rel_url)
+            logging.info("[req=%s] client disconnected", req_id)
         finally:
             with contextlib.suppress(ConnectionResetError, RuntimeError):
                 await downstream.write_eof()
@@ -902,102 +750,36 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             )
             return downstream
     except ClientError as exc:
-        logging.exception("[req=%s] Failed to proxy request to backend", req_id)
+        logging.exception("[req=%s] proxy failure", req_id)
         return web.json_response(
             {"error": "bad gateway", "detail": str(exc)},
-            status=502,
-            headers={"X-Backend": manager.state, "X-Request-ID": req_id},
+            status=502, headers={"X-Request-ID": req_id},
         )
     finally:
         manager.end_request()
 
 
 async def health_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    return web.json_response(
-        {
-            "status": "ok",
-            "backend": manager.state,
-            "active_requests": manager.active_requests,
-        },
-        headers={"X-Backend": manager.state},
-    )
-
-
-async def models_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    return web.json_response(
-        build_models_payload(manager),
-        headers={"X-Backend": manager.state},
-    )
-
-
-async def openai_models_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    return web.json_response(
-        build_openai_models_payload(manager),
-        headers={"X-Backend": manager.state},
-    )
-
-
-async def props_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    return web.json_response(
-        build_props_payload(manager),
-        headers={"X-Backend": manager.state},
-    )
-
-
-async def slots_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    return web.json_response(
-        build_slots_payload(manager),
-        headers={"X-Backend": manager.state},
-    )
-
-
-async def model_load_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-
-    manager.begin_request()
-    try:
-        await manager.ensure_running()
-        return web.json_response(
-            {"status": "ok", "model": manager.config.alias},
-            headers={"X-Backend": manager.state},
-        )
-    except Exception as exc:
-        logging.exception("Failed to load backend from /models/load")
-        return web.json_response(
-            {"error": "backend unavailable", "detail": str(exc)},
-            status=503,
-            headers={
-                "Retry-After": str(RETRY_AFTER_SECONDS),
-                "X-Backend": manager.state,
-            },
-        )
-    finally:
-        manager.end_request()
-
-
-async def model_unload_handler(request: web.Request) -> web.Response:
-    manager: ServerManager = request.app["manager"]
-    await manager.stop("remote unload request")
-    return web.json_response(
-        {"status": "ok", "model": manager.config.alias},
-        headers={"X-Backend": manager.state},
-    )
+    manager: ModelManager = request.app["manager"]
+    return web.json_response({
+        "status": "ok",
+        "router": "running" if manager.server_running else "down",
+        "loaded": manager.model_loaded,
+        "active_requests": manager.active_requests,
+    })
 
 
 async def lifecycle_context(app: web.Application):
     session = ClientSession(timeout=ClientTimeout(total=None))
-    manager = ServerManager(app["config"], session)
-    watchdog_task = asyncio.create_task(idle_watchdog(manager))
+    manager = ModelManager(app["config"], session)
     chat_logger = ChatLogger(ROOT / "logs") if app["config"].chat_log else None
 
     app["session"] = session
     app["manager"] = manager
     app["chat_logger"] = chat_logger
+
+    await manager.start_server()
+    watchdog_task = asyncio.create_task(idle_watchdog(manager))
 
     try:
         yield
@@ -1005,33 +787,27 @@ async def lifecycle_context(app: web.Application):
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
-        await manager.stop("proxy shutdown")
-        if manager._process_watch_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await manager._process_watch_task
+        await manager.stop_server()
         with contextlib.suppress(Exception):
             await session.close()
         if chat_logger is not None:
             chat_logger.close()
 
 
-async def idle_watchdog(manager: ServerManager) -> None:
+async def idle_watchdog(manager: ModelManager) -> None:
     while True:
         await asyncio.sleep(manager.config.idle_check_interval)
-        await manager.stop_if_idle()
+        try:
+            await manager.unload_if_idle()
+        except Exception:
+            logging.exception("idle watchdog error")
 
 
 def build_app(config: ProxyConfig) -> web.Application:
     app = web.Application(client_max_size=128 * 1024 * 1024)
     app["config"] = config
     app.cleanup_ctx.append(lifecycle_context)
-    app.router.add_route("*", "/health", health_handler)
-    app.router.add_route("*", "/models", models_handler)
-    app.router.add_route("POST", "/models/load", model_load_handler)
-    app.router.add_route("POST", "/models/unload", model_unload_handler)
-    app.router.add_route("*", "/props", props_handler)
-    app.router.add_route("*", "/slots", slots_handler)
-    app.router.add_route("*", "/v1/models", openai_models_handler)
+    app.router.add_route("GET", "/health", health_handler)
     app.router.add_route("*", "/{tail:.*}", proxy_request)
     return app
 
@@ -1040,32 +816,21 @@ def main() -> int:
     configure_logging()
     config = build_config()
     logging.info(
-        "Starting proxy on %s:%s -> backend %s:%s",
-        config.proxy_host,
-        config.proxy_port,
-        config.server_host,
-        config.server_port,
-    )
-    logging.info(
-        "Proxy config: model=%s context=%s idle_timeout=%ss",
-        config.model_path.name,
-        config.context_size,
-        config.idle_timeout,
+        "Proxy %s:%s -> router %s:%s | default=%s | idle=%ss",
+        config.proxy_host, config.proxy_port,
+        config.server_host, config.server_port,
+        config.default_model, config.idle_timeout,
     )
     try:
         web.run_app(
             build_app(config),
-            host=config.proxy_host,
-            port=config.proxy_port,
+            host=config.proxy_host, port=config.proxy_port,
             reuse_address=True,
-            access_log_format='%a req=%{X-Request-ID}o "%r" %s %b %Dus "%{User-Agent}i"',
+            access_log_format='%a req=%{X-Request-ID}o "%r" %s %b %Dus',
         )
     except OSError as e:
         if "address already in use" in str(e).lower():
-            logging.error(
-                "Port %s is already in use. Another proxy or llama-server may still be running.",
-                config.proxy_port,
-            )
+            logging.error("Port %s already in use", config.proxy_port)
         raise
     return 0
 
