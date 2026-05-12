@@ -1,116 +1,90 @@
 # llama.cpp Wake-on-Demand Proxy
 
-This workspace runs `llama-server.exe` behind an always-on Python proxy.
+Two `llama-server.exe` router instances behind small Python proxies, exposed over a
+cloudflared tunnel. Each proxy loads its model on first request and unloads after
+10 minutes of inactivity — the router process stays up so the tunnel never breaks.
 
-- Proxy listens on `8001`
-- `llama-server` listens on `8002`
-- The proxy starts `llama-server` on the first real request
-- The proxy stops `llama-server` after the configured idle timeout
+```
+cloudflared
+  ├─ ai.htk-hrt.cc      → :8001 proxy.py        → :8002 router (chat models)
+  └─ embed.htk-hrt.cc   → :8003 embed_proxy.py  → :8004 router (embedder)
+```
 
-The main launcher is `watchdog_qwen.ps1`. It resolves Python, installs `aiohttp` if needed, starts `proxy.py`, and optionally restarts the proxy if it crashes.
+Both stacks run side-by-side as independent processes; both models can be loaded
+concurrently.
 
 ## Files
 
-- `watchdog_qwen.ps1` - main startup script
-- `proxy.py` - always-on wake-on-demand proxy
-- `watchdog.log` - launcher log output
+| File | Role |
+|---|---|
+| `proxy.py` | Chat proxy + router supervisor. Generates `models-preset.ini` at startup. |
+| `embed_proxy.py` | Embedding proxy + router supervisor. Generates `embed-preset.ini`. |
+| `watchdog.ps1` | Restart-on-crash supervisor for `proxy.py`. |
+| `watchdog-embed.ps1` | Restart-on-crash supervisor for `embed_proxy.py`. |
+| `models-preset.ini` | Auto-generated. Every `MODELS × CTX_CHOICES` combo as its own preset. |
+| `embed-preset.ini` | Auto-generated. Single preset for `Qwen3-Embedding-4B`. |
+| `ping-both.py` | Fires a chat + embedding request concurrently end-to-end. |
+| `cloudflared/run-tunnel.ps1` | Launches `cloudflared.exe` with daily log rotation. |
+| `models/` | GGUF weights. `models/_aux/` holds mmproj projectors. |
+| `llama.cpp_latest/llama-server.exe` | The router binary. |
 
-## Startup Sequence
+## Run it
 
-Open PowerShell in `H:\llama.cpp`, then run one of these commands.
-
-### Normal Start
-
-This keeps the proxy supervised and uses the default 10 minute idle timeout.
-
-```powershell
-.\watchdog_qwen.ps1
-```
-
-### Manual Test Start
-
-This is useful when validating wake and sleep behavior quickly.
+Three terminals (or service them however you like — they're independent):
 
 ```powershell
-.\watchdog_qwen.ps1 -noRestart -idleTimeout 60
+H:\llama.cpp\watchdog.ps1                  # chat stack on :8001
+H:\llama.cpp\watchdog-embed.ps1            # embed stack on :8003
+H:\cloudflared\run-tunnel.ps1              # public tunnel
 ```
 
-Notes:
-
-- `-noRestart` runs the proxy once and does not relaunch it if it exits
-- `-idleTimeout 60` asks the proxy to stop the backend after 60 idle seconds
-- Idle shutdown is checked periodically, so the actual stop can happen a bit later than the exact timeout
-
-### Other Variants
+Headless chat variant (skip the interactive picker — sets the *fallback* model
+when a client request omits the `model` field; all combos are still routable):
 
 ```powershell
-.\watchdog_qwen.ps1 -q4
-.\watchdog_qwen.ps1 -long
-.\watchdog_qwen.ps1 -q4 -long
+H:\llama.cpp\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768
 ```
 
-- `-q4` uses `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
-- `-long` uses a `262144` context window instead of `131072`
+## Endpoints
 
-## What Happens During Boot
+- **Chat:** `https://ai.htk-hrt.cc/v1/chat/completions` — model field selects preset (e.g. `qwen3.6-35b-q3-32k`).
+- **Embeddings:** `https://embed.htk-hrt.cc/v1/embeddings` — model `qwen3-embedding-4b-8k`.
+- Both require `Authorization: Bearer $LLAMA_API_KEY`.
 
-1. `watchdog_qwen.ps1` starts `proxy.py`
-2. `proxy.py` binds to `0.0.0.0:8001`
-3. The proxy answers `/health`, `/models`, `/props`, and `/slots` immediately
-4. Pi connects to the proxy on port `8001`
-5. The first chat request causes the proxy to launch `llama-server.exe` on `127.0.0.1:8002`
-6. The proxy waits for backend health, then forwards the request
-7. After the backend stays idle past the timeout, the proxy stops it and frees VRAM
+`/health` on either port reports proxy + router state and which model is currently loaded.
 
-## Pi Boot Sequence
-
-After the proxy is running:
-
-1. Start Pi normally
-2. Let Pi connect to the configured llama.cpp URL
-3. Send a first message such as `hey there`
-4. Expect the first response to be slower because it includes backend startup time
-5. Wait for the idle timeout to expire
-6. Send another message to confirm the backend wakes again
-
-## Quick Checks
-
-### Check Proxy Health
+## Verify
 
 ```powershell
-Invoke-WebRequest -Uri 'http://127.0.0.1:8001/health' -UseBasicParsing
+H:\llama.cpp\.venv\Scripts\python.exe H:\llama.cpp\ping-both.py            # through the tunnel
+H:\llama.cpp\.venv\Scripts\python.exe H:\llama.cpp\ping-both.py --local    # localhost only
 ```
 
-Expected behavior:
+## How the load/unload flow works
 
-- HTTP `200`
-- JSON contains `"status": "ok"`
-- Header `X-Backend` is `offline`, `booting`, or `running`
+1. Watchdog starts the proxy. Proxy spawns the router with `--no-models-autoload` and `--models-max 1`. GPU is idle, router is healthy.
+2. First chat/embedding request arrives. Proxy POSTs `/models/load` to the router, polls `/v1/models` until `status.value == "loaded"`, then forwards.
+3. Idle watchdog (inside each proxy) checks every 30s. After 10 minutes of no activity it POSTs `/models/unload`. VRAM frees; router stays running; tunnel socket stays alive.
+4. Next request reloads on demand.
 
-### Check Synthetic Model Discovery
+Cold-load latency: ~15–20s for the 35B chat model on a 3090 Ti; ~2–3s for the 4B embedder.
 
-```powershell
-Invoke-RestMethod -Uri 'http://127.0.0.1:8001/models' -Headers @{ Authorization = 'Bearer rRZsSjRvaUuRMr5AeDA14rO9jaSlhSRhRtBI5ZlO' }
-```
+## Adding a model
 
-This endpoint lets `pi-llama-cpp` discover the model even while the backend is asleep.
+Chat side — append a `ModelChoice(...)` to `MODELS` in `proxy.py`. Every entry is automatically crossed with `CTX_CHOICES` to produce one preset per (model × ctx) pair. No INI editing.
 
-### Check Whether Backend Is Running
+Embed side — `embed_proxy.py` is hardcoded to a single model (`MODEL_FILE`, `MODEL_ID`, `CTX_SIZE` constants at the top). Change those if you swap the embedder.
 
-```powershell
-Get-NetTCPConnection -LocalPort 8002 -State Listen
-Get-Process -Name 'llama-server'
-```
+## Logs
 
-## Stop Sequence
+- `logs/<date>.log` — chat proxy events
+- `logs/embed-proxy-<date>.log` — embed proxy events
+- `logs/llama-server-<date>.log` — chat router output
+- `logs/embed-server-<date>.log` — embed router output
+- `logs/chat-<date>.log` and `logs/chat-<date>.raw.jsonl` — per-request chat traces (proxy.py only)
+- `cloudflared/logs/<date>.log` — tunnel logs
 
-If you started with `-noRestart`, stop it with `Ctrl+C` in that PowerShell window.
+## Background docs
 
-If you started without `-noRestart`, `Ctrl+C` also stops the supervised proxy loop.
-
-## Troubleshooting
-
-- If Pi says no models are available, verify `http://127.0.0.1:8001/health` returns `status: ok`
-- If Pi can connect but first inference fails, inspect `watchdog.log` and the active PowerShell window for `llama-server` startup errors
-- If `aiohttp` is missing, rerun `watchdog_qwen.ps1`; it will try to install it automatically
-- If port `8001` is already in use, stop the conflicting process before starting the proxy
+`ROUTER_MODE_SETUP.md` is the migration write-up from the pre-router proxy to the
+current router-mode design. Useful context, not required reading.

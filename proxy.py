@@ -60,7 +60,7 @@ MODELS: list[ModelChoice] = [
     ),
 ]
 
-CTX_CHOICES: list[int] = [32768, 65536, 131072]
+CTX_CHOICES: list[int] = [32768, 65536, 98304, 131072]
 
 PROXY_HOST = "::"
 PROXY_PORT = 8001
@@ -766,7 +766,7 @@ async def models_handler(request: web.Request) -> web.Response:
             payload = json.loads(body_text)
         except (ValueError, TypeError):
             return web.Response(status=upstream.status, body=body_text,
-                                content_type=upstream.headers.get("Content-Type", "application/json"))
+                                content_type=upstream.content_type or "application/json")
         for entry in payload.get("data") or []:
             status = entry.get("status")
             if isinstance(status, dict) and status.get("value") == "unloaded":
@@ -799,7 +799,7 @@ async def props_handler(request: web.Request) -> web.Response:
         return web.Response(
             status=upstream.status,
             body=body_text,
-            content_type=upstream.headers.get("Content-Type", "application/json"),
+            content_type=upstream.content_type or "application/json",
         )
 
 
