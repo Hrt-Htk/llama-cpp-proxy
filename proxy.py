@@ -66,13 +66,15 @@ PROXY_HOST = "::"
 PROXY_PORT = 8001
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8002
+EMBED_PROXY_HOST = "127.0.0.1"
+EMBED_PROXY_PORT = 8003
 IDLE_TIMEOUT = 600  # 10 minutes of inactivity before unload
 IDLE_CHECK_INTERVAL = 30  # check every 30s
 HEALTH_POLL_INTERVAL = 1.0
 BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
-API_KEY = os.environ.get("LLAMA_API_KEY", "rRZsSjRvaUuRMr5AeDA14rO9jaSlhSRhRtBI5ZlO")
+API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -98,11 +100,17 @@ class ProxyConfig:
     boot_timeout: int
     default_model: str
     api_key: str
+    embed_host: str
+    embed_port: int
     chat_log: bool = True
 
     @property
     def backend_base_url(self) -> str:
         return f"http://{self.server_host}:{self.server_port}"
+
+    @property
+    def embed_base_url(self) -> str:
+        return f"http://{self.embed_host}:{self.embed_port}"
 
     @property
     def server_command(self) -> list[str]:
@@ -580,6 +588,8 @@ def build_config() -> ProxyConfig:
     p.add_argument("--ctx-size", type=int, default=None,
                    help="Skip the context picker (any int; menu offers 32k/64k/128k)")
     p.add_argument("--api-key", default=API_KEY)
+    p.add_argument("--embed-host", default=EMBED_PROXY_HOST)
+    p.add_argument("--embed-port", type=int, default=EMBED_PROXY_PORT)
     p.add_argument("--no-chat-log", action="store_true")
     args = p.parse_args()
 
@@ -603,6 +613,8 @@ def build_config() -> ProxyConfig:
         boot_timeout=args.boot_timeout,
         default_model=default_id,
         api_key=args.api_key,
+        embed_host=args.embed_host,
+        embed_port=args.embed_port,
         chat_log=not args.no_chat_log,
     )
 
@@ -627,6 +639,39 @@ def filter_response_headers(headers) -> dict[str, str]:
             continue
         forwarded[name] = value
     return forwarded
+
+
+def client_ip(request: web.Request) -> str:
+    """Real client IP — CF-Connecting-IP when behind the Cloudflare tunnel,
+    otherwise the peer address (which is just cloudflared's loopback)."""
+    return request.headers.get("CF-Connecting-IP") or request.remote or "-"
+
+
+# Paths reachable without an API key. /health is the cloudflared/uptime probe.
+PUBLIC_PATHS = {"/health"}
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """Reject any request that doesn't carry the configured API key.
+
+    This proxy is the internet-facing origin for the Cloudflare tunnel, so
+    it — not the localhost-only llama-server behind it — is where client
+    authentication has to happen. filter_request_headers() still injects the
+    key on the *upstream* hop so the backend keeps trusting only this proxy.
+    """
+    config: ProxyConfig = request.app["config"]
+    if not config.api_key or request.path.rstrip("/") in PUBLIC_PATHS:
+        return await handler(request)
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+    if not token or not secrets.compare_digest(token, config.api_key):
+        logging.warning(
+            "401 unauthorized: %s %s from %s",
+            request.method, request.path, client_ip(request),
+        )
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
 
 
 def _inject_cache_prompt(body: bytes | None, method: str, path: str) -> bytes | None:
@@ -731,8 +776,9 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 await downstream.write_eof()
             duration_ms = int((time.monotonic() - started) * 1000)
             logging.info(
-                "[req=%s] %s %s -> %s in %dms",
-                req_id, request.method, request.rel_url, downstream.status, duration_ms,
+                "[req=%s] %s %s %s -> %s in %dms",
+                req_id, client_ip(request), request.method, request.rel_url,
+                downstream.status, duration_ms,
             )
             return downstream
     except ClientError as exc:
@@ -803,6 +849,74 @@ async def props_handler(request: web.Request) -> web.Response:
         )
 
 
+async def embed_forward(request: web.Request) -> web.StreamResponse:
+    """Reverse-proxy /embed/* to the standalone embed_proxy on :8003.
+
+    Strips the /embed prefix so embed_proxy sees plain OpenAI-style paths
+    (/v1/embeddings, /v1/models, /health, ...). embed_proxy owns its own
+    router, load/unload, and idle timer — this is a dumb HTTP forwarder.
+    """
+    session: ClientSession = request.app["session"]
+    config: ProxyConfig = request.app["config"]
+    req_id = secrets.token_hex(4)
+    started = time.monotonic()
+
+    tail = request.match_info.get("tail", "")
+    sub_path = "/" + tail if tail else "/"
+    query = request.rel_url.query_string
+    target_url = f"{config.embed_base_url}{sub_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
+
+    body = await request.read() if request.can_read_body else None
+    headers = filter_request_headers(request.headers, config.api_key)
+
+    try:
+        upstream_resp = await session.request(
+            request.method, target_url, headers=headers,
+            data=body, allow_redirects=False, timeout=None,
+        )
+        response_headers = filter_response_headers(upstream_resp.headers)
+        response_headers["X-Request-ID"] = req_id
+        downstream = web.StreamResponse(
+            status=upstream_resp.status, reason=upstream_resp.reason, headers=response_headers,
+        )
+        await downstream.prepare(request)
+        try:
+            is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
+            if is_sse:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(upstream_resp.content.readany(), timeout=25)
+                    except asyncio.TimeoutError:
+                        await downstream.write(b": keep-alive\n\n")
+                        continue
+                    if not chunk:
+                        break
+                    await downstream.write(chunk)
+            else:
+                async for chunk in upstream_resp.content.iter_any():
+                    await downstream.write(chunk)
+        except ConnectionResetError:
+            logging.info("[embed req=%s] client disconnected", req_id)
+        finally:
+            with contextlib.suppress(ConnectionResetError, RuntimeError):
+                await downstream.write_eof()
+            duration_ms = int((time.monotonic() - started) * 1000)
+            logging.info(
+                "[embed req=%s] %s %s /embed%s -> %s in %dms",
+                req_id, client_ip(request), request.method, sub_path,
+                downstream.status, duration_ms,
+            )
+            return downstream
+    except ClientError as exc:
+        logging.exception("[embed req=%s] forward failure", req_id)
+        return web.json_response(
+            {"error": "bad gateway", "detail": str(exc)},
+            status=502, headers={"X-Request-ID": req_id},
+        )
+
+
 async def health_handler(request: web.Request) -> web.Response:
     manager: ModelManager = request.app["manager"]
     return web.json_response({
@@ -848,12 +962,16 @@ async def idle_watchdog(manager: ModelManager) -> None:
 
 
 def build_app(config: ProxyConfig) -> web.Application:
-    app = web.Application(client_max_size=128 * 1024 * 1024)
+    app = web.Application(client_max_size=128 * 1024 * 1024, middlewares=[auth_middleware])
     app["config"] = config
     app.cleanup_ctx.append(lifecycle_context)
     app.router.add_route("GET", "/health", health_handler)
     app.router.add_route("GET", "/models", models_handler)
     app.router.add_route("GET", "/props", props_handler)
+    # /embed and /embed/* are reverse-proxied to embed_proxy on :8003. Must
+    # come before the catch-all so embed traffic never hits the chat router.
+    app.router.add_route("*", "/embed", embed_forward)
+    app.router.add_route("*", "/embed/{tail:.*}", embed_forward)
     app.router.add_route("*", "/{tail:.*}", proxy_request)
     return app
 

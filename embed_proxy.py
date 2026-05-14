@@ -40,7 +40,7 @@ HEALTH_POLL_INTERVAL = 1.0
 BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 120
 RETRY_AFTER_SECONDS = 30
-API_KEY = os.environ.get("LLAMA_API_KEY", "rRZsSjRvaUuRMr5AeDA14rO9jaSlhSRhRtBI5ZlO")
+API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -322,6 +322,39 @@ def filter_response_headers(headers) -> dict[str, str]:
     return forwarded
 
 
+def client_ip(request: web.Request) -> str:
+    """Real client IP — CF-Connecting-IP when behind the Cloudflare tunnel,
+    otherwise the peer address (which is just cloudflared's loopback)."""
+    return request.headers.get("CF-Connecting-IP") or request.remote or "-"
+
+
+# Paths reachable without an API key. /health is the cloudflared/uptime probe.
+PUBLIC_PATHS = {"/health"}
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """Reject any request that doesn't carry the configured API key.
+
+    This proxy is the internet-facing origin for the Cloudflare tunnel, so
+    it — not the localhost-only llama-server behind it — is where client
+    authentication has to happen. filter_request_headers() still injects the
+    key on the *upstream* hop so the backend keeps trusting only this proxy.
+    """
+    config: ProxyConfig = request.app["config"]
+    if not config.api_key or request.path.rstrip("/") in PUBLIC_PATHS:
+        return await handler(request)
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+    if not token or not secrets.compare_digest(token, config.api_key):
+        logging.warning(
+            "401 unauthorized: %s %s from %s",
+            request.method, request.path, client_ip(request),
+        )
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
+
+
 async def proxy_request(request: web.Request) -> web.StreamResponse:
     manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
@@ -368,8 +401,9 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 await downstream.write_eof()
             duration_ms = int((time.monotonic() - started) * 1000)
             logging.info(
-                "[req=%s] %s %s -> %s in %dms",
-                req_id, request.method, request.rel_url, downstream.status, duration_ms,
+                "[req=%s] %s %s %s -> %s in %dms",
+                req_id, client_ip(request), request.method, request.rel_url,
+                downstream.status, duration_ms,
             )
             return downstream
     except ClientError as exc:
@@ -423,7 +457,7 @@ async def idle_watchdog(manager: ModelManager) -> None:
 
 
 def build_app(config: ProxyConfig) -> web.Application:
-    app = web.Application(client_max_size=32 * 1024 * 1024)
+    app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[auth_middleware])
     app["config"] = config
     app.cleanup_ctx.append(lifecycle_context)
     app.router.add_route("GET", "/health", health_handler)

@@ -26,6 +26,7 @@ logs/
 .claude/settings.local.json
 *.auth.json
 auth.json
+api-key.txt
 
 # OS files
 .DS_Store
