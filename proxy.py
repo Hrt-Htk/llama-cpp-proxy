@@ -641,6 +641,15 @@ def filter_response_headers(headers) -> dict[str, str]:
     return forwarded
 
 
+def _strip_chat_prefix(path: str) -> str:
+    """Strip the /chat alias prefix so backend sees plain /v1/... paths."""
+    if path == "/chat":
+        return "/"
+    if path.startswith("/chat/"):
+        return path[len("/chat"):]
+    return path
+
+
 def client_ip(request: web.Request) -> str:
     """Real client IP — CF-Connecting-IP when behind the Cloudflare tunnel,
     otherwise the peer address (which is just cloudflared's loopback)."""
@@ -709,11 +718,13 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     started = time.monotonic()
     manager.begin_request()
 
+    effective_path = _strip_chat_prefix(request.path)
+
     try:
         body = await request.read() if request.can_read_body else None
-        body = _inject_cache_prompt(body, request.method, request.path)
+        body = _inject_cache_prompt(body, request.method, effective_path)
         # Only ensure-load for endpoints that need a model
-        path = request.path.rstrip("/")
+        path = effective_path.rstrip("/")
         if path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
             model = _model_from_body(body, manager.config.default_model)
             await manager.ensure_loaded(model)
@@ -729,7 +740,10 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     if chat_logger is not None:
         await chat_logger.log_request(request.method, request.path, body, req_id)
 
-    target_url = f"{manager.config.backend_base_url}{request.rel_url}"
+    query = request.rel_url.query_string
+    target_url = f"{manager.config.backend_base_url}{effective_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
 
     try:
@@ -804,7 +818,11 @@ async def models_handler(request: web.Request) -> web.Response:
     """
     manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
-    target_url = f"{manager.config.backend_base_url}{request.rel_url}"
+    effective_path = _strip_chat_prefix(request.path)
+    query = request.rel_url.query_string
+    target_url = f"{manager.config.backend_base_url}{effective_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
     async with session.get(target_url, headers=headers) as upstream:
         body_text = await upstream.text()
@@ -834,7 +852,11 @@ async def props_handler(request: web.Request) -> web.Response:
     """
     manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
-    target_url = f"{manager.config.backend_base_url}{request.rel_url}"
+    effective_path = _strip_chat_prefix(request.path)
+    query = request.rel_url.query_string
+    target_url = f"{manager.config.backend_base_url}{effective_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
     async with session.get(target_url, headers=headers) as upstream:
         body_text = await upstream.text()
@@ -850,9 +872,9 @@ async def props_handler(request: web.Request) -> web.Response:
 
 
 async def embed_forward(request: web.Request) -> web.StreamResponse:
-    """Reverse-proxy /embed/* to the standalone embed_proxy on :8003.
+    """Reverse-proxy /embedding/* to the standalone embed_proxy on :8003.
 
-    Strips the /embed prefix so embed_proxy sees plain OpenAI-style paths
+    Strips the prefix so embed_proxy sees plain OpenAI-style paths
     (/v1/embeddings, /v1/models, /health, ...). embed_proxy owns its own
     router, load/unload, and idle timer — this is a dumb HTTP forwarder.
     """
@@ -904,8 +926,8 @@ async def embed_forward(request: web.Request) -> web.StreamResponse:
                 await downstream.write_eof()
             duration_ms = int((time.monotonic() - started) * 1000)
             logging.info(
-                "[embed req=%s] %s %s /embed%s -> %s in %dms",
-                req_id, client_ip(request), request.method, sub_path,
+                "[embed req=%s] %s %s %s -> %s in %dms",
+                req_id, client_ip(request), request.method, request.path,
                 downstream.status, duration_ms,
             )
             return downstream
@@ -967,11 +989,19 @@ def build_app(config: ProxyConfig) -> web.Application:
     app.cleanup_ctx.append(lifecycle_context)
     app.router.add_route("GET", "/health", health_handler)
     app.router.add_route("GET", "/models", models_handler)
+    app.router.add_route("GET", "/chat/models", models_handler)
     app.router.add_route("GET", "/props", props_handler)
-    # /embed and /embed/* are reverse-proxied to embed_proxy on :8003. Must
-    # come before the catch-all so embed traffic never hits the chat router.
-    app.router.add_route("*", "/embed", embed_forward)
-    app.router.add_route("*", "/embed/{tail:.*}", embed_forward)
+    app.router.add_route("GET", "/chat/props", props_handler)
+    # /embedding and /embedding/* are reverse-proxied to embed_proxy on
+    # :8003. Must come before the chat catch-all so embed traffic never hits
+    # the chat router.
+    app.router.add_route("*", "/embedding", embed_forward)
+    app.router.add_route("*", "/embedding/{tail:.*}", embed_forward)
+    # /chat/* is the public alias for chat completions; bare /v1/... at the
+    # root still works for backwards compat. Both go through proxy_request,
+    # which strips the /chat prefix before forwarding to the chat router.
+    app.router.add_route("*", "/chat", proxy_request)
+    app.router.add_route("*", "/chat/{tail:.*}", proxy_request)
     app.router.add_route("*", "/{tail:.*}", proxy_request)
     return app
 

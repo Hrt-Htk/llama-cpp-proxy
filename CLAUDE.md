@@ -2,16 +2,19 @@
 
 Two independent Python proxies wrap two `llama-server.exe` router instances.
 Cloudflared exposes them under a single hostname; `proxy.py` reverse-proxies
-`/embed/*` to the embed stack on :8003.
+`/embedding/*` to the embed stack on :8003.
 
 ```
-ai.htk-hrt.cc           → :8001 proxy.py        → :8002 router (chat)
-ai.htk-hrt.cc/embed/*   → :8001 proxy.py        → :8003 embed_proxy.py → :8004 router (embeddings)
+ai.htk-hrt.cc/chat/*       → :8001 proxy.py     → :8002 router (chat)
+ai.htk-hrt.cc/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
 ```
+
+Bare `ai.htk-hrt.cc/v1/...` at the root also still hits the chat router
+(backwards compat); the `/chat` prefix is the preferred public alias.
 
 ## Code
 
-- `proxy.py` — chat proxy. Owns the chat router process, generates `models-preset.ini` at startup from `MODELS × CTX_CHOICES`, load/unload via `/models/load` & `/models/unload`, idle-unloads after 10 min. Has chat logging (`logs/chat-<date>.log`) and SSE chunk capture. Also reverse-proxies `/embed/*` to `embed_proxy.py` on :8003 (strips the `/embed` prefix; embed lifecycle stays owned by `embed_proxy.py`).
+- `proxy.py` — chat proxy. Owns the chat router process, generates `models-preset.ini` at startup from `MODELS × CTX_CHOICES`, load/unload via `/models/load` & `/models/unload`, idle-unloads after 10 min. Has chat logging (`logs/chat-<date>.log`) and SSE chunk capture. Also reverse-proxies `/embedding/*` to `embed_proxy.py` on :8003 (strips the `/embedding` prefix; embed lifecycle stays owned by `embed_proxy.py`).
 - `embed_proxy.py` — slimmed-down twin of `proxy.py` for the embedder. Single model, no chat logging, no SSE parsing. Same load/unload pattern.
 - `watchdog.ps1` / `watchdog-embed.ps1` — thin restart-on-crash supervisors. They forward all extra args to the underlying Python script.
 - `ping-both.py` — concurrent chat+embedding smoke test. `--local` skips the tunnel.
