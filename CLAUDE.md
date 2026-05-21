@@ -42,8 +42,9 @@ All under `logs/`. Daily-rotated. Two pairs (`<proxy>-<date>.log` from the proxy
 
 - **Router stays up across model loads/unloads** — that's the whole point. Don't kill the router process on idle; only call `/models/unload`.
 - **`--models-max 1` per router** — loading a different model evicts the current one. The two routers don't share state, so chat and embedder coexist fine.
+- **MTP (built-in speculative decoding) is available on the 27B** as a *separate, additional* model `qwen3.6-27b-q4-mtp` (label "Qwen3.6-27B Q4 MTP", weights `models/Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf`). Enabled per-model via `spec_mtp=True` on its `ModelChoice`, which makes `_model_preset_section` emit `spec-type=draft-mtp`, `spec-draft-n-max=3`, `spec-draft-p-min=0.0`. Requires the b9209+ router binary (PR ggml-org/llama.cpp#22673). The original non-MTP `qwen3.6-27b-q4` and both 35B models are unchanged — only one model loads at a time (`--models-max 1`), so the extra preset costs no VRAM unless selected.
 - **API key** comes from `$env:LLAMA_API_KEY` with a hardcoded fallback in both proxies. The proxies inject `Authorization: Bearer …` if the client omits it.
-- **Preset IDs are the API model names.** Chat: `qwen3.6-35b-q3-32k`, `…-q4-128k`, etc. Embed: `qwen3-embedding-4b-8k`. Clients pick via the `model` field in the request body.
+- **Preset IDs are the API model names.** Chat: `qwen3.6-35b-q3-32k`, `…-q4-128k`, `qwen3.6-27b-q4-mtp` (MTP), etc. Embed: `qwen3-embedding-4b-8k`. Clients pick via the `model` field in the request body.
 
 ## Background
 

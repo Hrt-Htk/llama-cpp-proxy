@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -14,6 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+
+from log_paths import (
+    DATE_FMT,
+    LocalTzFormatter,
+    current_week_dir,
+    fmt_ts_full,
+    fmt_ts_short,
+    local_now,
+)
 
 # Enable ANSI escape sequences on Windows 10+
 if sys.platform == "win32":
@@ -34,6 +42,7 @@ class ModelChoice:
     base_id: str        # e.g. "qwen3.6-35b-q3" — ctx suffix appended at render time
     model_file: Path    # GGUF weights
     mmproj_file: Path   # multimodal projector
+    spec_mtp: bool = False  # enable built-in MTP speculative decoding (draft-mtp)
 
     def preset_id(self, ctx: int) -> str:
         return f"{self.base_id}-{ctx // 1024}k"
@@ -58,6 +67,13 @@ MODELS: list[ModelChoice] = [
         ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.gguf",
         ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
     ),
+    ModelChoice(
+        "Qwen3.6-27B Q4 MTP",
+        "qwen3.6-27b-q4-mtp",
+        ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf",
+        ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
+        spec_mtp=True,
+    ),
 ]
 
 CTX_CHOICES: list[int] = [32768, 65536, 98304, 131072]
@@ -66,7 +82,7 @@ PROXY_HOST = "::"
 PROXY_PORT = 8001
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8002
-EMBED_PROXY_HOST = "127.0.0.1"
+EMBED_PROXY_HOST = "::1"
 EMBED_PROXY_PORT = 8003
 IDLE_TIMEOUT = 600  # 10 minutes of inactivity before unload
 IDLE_CHECK_INTERVAL = 30  # check every 30s
@@ -110,18 +126,28 @@ class ProxyConfig:
 
     @property
     def embed_base_url(self) -> str:
-        return f"http://{self.embed_host}:{self.embed_port}"
+        host = self.embed_host
+        if ":" in host:
+            host = f"[{host}]"  # IPv6 needs brackets in URLs
+        return f"http://{host}:{self.embed_port}"
 
     @property
     def server_command(self) -> list[str]:
-        log_file = ROOT / "logs" / f"llama-server-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
-        log_file.parent.mkdir(exist_ok=True)
+        log_file = current_week_dir(ROOT / "logs") / f"llama-server-{local_now().strftime(DATE_FMT)}.log"
         return [
             str(SERVER_EXE),
             "--log-file", str(log_file),
+            "--log-timestamps",
+            "--log-prefix",
             "--models-preset", str(PRESET_PATH),
             "--models-max", "1",
             "--no-models-autoload",
+            # --- perf A/B test: chat-template flags (see chat_template_perf_test.md) ---
+            # Variant D: full new config (jinja + custom template + preserve_thinking kwarg)
+            "--jinja",
+            "--chat-template-file", str(ROOT / "chat_template.jinja"),
+            "--chat-template-kwargs", '{"preserve_thinking":true}',
+            # ------------------------------------------------------------------------
             "--host", self.server_host,
             "--port", str(self.server_port),
             "--api-key", self.api_key,
@@ -169,7 +195,10 @@ class ModelManager:
         if self.server_running:
             return
         logging.info(
-            "Starting router on %s:%s", self.config.server_host, self.config.server_port,
+            "Starting router on %s:%s | boot_ts=%s",
+            self.config.server_host,
+            self.config.server_port,
+            fmt_ts_full(),
         )
         self.process = await asyncio.create_subprocess_exec(
             *self.config.server_command, cwd=str(ROOT),
@@ -286,7 +315,11 @@ RAW_BODY_CAP = 1024 * 1024
 
 
 class ChatLogger:
-    """Rotating chat logger — one file per day in the logs/ directory."""
+    """Rotating chat logger — one file per day, bucketed by ISO week folder.
+
+    Reopens when the local date rolls over (which also moves into a new week
+    folder when needed). Uses local Europe/Zurich timestamps with offset.
+    """
 
     def __init__(self, log_dir: Path) -> None:
         self.log_dir = log_dir
@@ -298,15 +331,16 @@ class ChatLogger:
         self._open_for_today()
 
     def _open_for_today(self) -> None:
-        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date = local_now().strftime(DATE_FMT)
         if self._date == date and self._fh is not None:
             return
         if self._fh is not None:
             self._fh.close()
         if self._raw_fh is not None:
             self._raw_fh.close()
-        self.log_file = self.log_dir / f"chat-{date}.log"
-        self.raw_file = self.log_dir / f"chat-{date}.raw.jsonl"
+        week_dir = current_week_dir(self.log_dir)
+        self.log_file = week_dir / f"chat-{date}.log"
+        self.raw_file = week_dir / f"chat-{date}.raw.jsonl"
         self._fh = open(self.log_file, "a", encoding="utf-8")
         self._raw_fh = open(self.raw_file, "a", encoding="utf-8")
         self._date = date
@@ -314,7 +348,7 @@ class ChatLogger:
     async def log_request(self, method: str, path: str, body: bytes | None, req_id: str) -> None:
         async with self._lock:
             self._open_for_today()
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            ts = fmt_ts_full()
             self._fh.write(f"=== [{ts}] [req={req_id}] {method} {path} ===\n")
             if body and path.rstrip("/") == "/v1/chat/completions":
                 self._write_latest_user_turn(body)
@@ -355,7 +389,7 @@ class ChatLogger:
     async def log_response(self, data: str, is_done: bool) -> None:
         async with self._lock:
             self._open_for_today()
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            ts = fmt_ts_short()
             if is_done:
                 self._fh.write(f"  [{ts}] [DONE]\n")
             else:
@@ -492,10 +526,9 @@ class SSEChunkLogger:
 
 def configure_logging() -> None:
     log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d.log")
-    logging.Formatter.converter = time.gmtime
-    fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
+    week_dir = current_week_dir(log_dir)
+    log_file = week_dir / f"proxy-{local_now().strftime(DATE_FMT)}.log"
+    fmt = LocalTzFormatter("%(asctime)s %(levelname)s %(message)s")
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
@@ -539,6 +572,13 @@ def pick_setup(model_arg: str | None, ctx_arg: int | None) -> tuple[ModelChoice,
 
 def _model_preset_section(model: ModelChoice, ctx: int) -> str:
     """Return the INI section text for a single (model, ctx) pair."""
+    spec = (
+        f"spec-type        = draft-mtp\n"
+        f"spec-draft-n-max = 3\n"
+        f"spec-draft-p-min = 0.0\n"
+        if model.spec_mtp
+        else ""
+    )
     return (
         f"[{model.preset_id(ctx)}]\n"
         f"model         = {model.model_file.as_posix()}\n"
@@ -554,6 +594,7 @@ def _model_preset_section(model: ModelChoice, ctx: int) -> str:
         f"temp          = 0.6\n"
         f"top-p         = 0.95\n"
         f"top-k         = 20\n"
+        + spec
     )
 
 
@@ -725,7 +766,10 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         body = _inject_cache_prompt(body, request.method, effective_path)
         # Only ensure-load for endpoints that need a model
         path = effective_path.rstrip("/")
-        if path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
+        if path in (
+            "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+            "/chat/completions", "/completions", "/embeddings",
+        ):
             model = _model_from_body(body, manager.config.default_model)
             await manager.ensure_loaded(model)
     except Exception as exc:
