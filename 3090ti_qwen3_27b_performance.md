@@ -102,3 +102,14 @@ Actual rollout results on this 3090 Ti with `Qwen3.6-27B-UD-Q4_K_XL`, 32k contex
 - MTP draft acceptance rate: **62-77%** across two runs
 
 This clears the rollout acceptance bar: acceptance rate **>=60%** and throughput **>=1.4x**.
+
+## n-max sweep (2026-05-21)
+
+| n-max | 2k | 32k | 64k | 96k |
+|---|---|---|---|---|
+| 2 | 65.1 \| 81% | 58.1 \| 84% | 46.2 \| 69% | 42.8 \| 74% |
+| 3 | 63.0 \| 67% | 58.1 \| 72% | 47.8 \| 63% | 35.5 \| 46% |
+| 4 | 50.8 \| 45% | 54.6 \| 60% | 40.2 \| 44% | 27.7 \| 28% |
+| 6 | 38.0 \| 30% | 41.0 \| 38% | 44.8 \| 50% | 33.6 \| 37% |
+
+With `spec-draft-p-min=0.0` the MTP head always drafts the full `n` tokens, so higher `n-max` drafts deeper, lower-confidence tokens that get rejected (error compounding) — costing verify slots without payoff. Result: `n-max=2` is fastest-or-tied at every depth and degrades most gracefully with context (at 96k, `n=2` gives 42.8 tok/s vs `n=3`'s 35.5, +21%). `n-max` 4 and 6 are strictly worse. Production value was therefore changed from 3 to 2. Caveat: absolute acceptance %s are inflated by synthetic filler text; the `n-max` ranking is the reliable signal.

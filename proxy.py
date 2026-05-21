@@ -574,7 +574,7 @@ def _model_preset_section(model: ModelChoice, ctx: int) -> str:
     """Return the INI section text for a single (model, ctx) pair."""
     spec = (
         f"spec-type        = draft-mtp\n"
-        f"spec-draft-n-max = 3\n"
+        f"spec-draft-n-max = 2\n"
         f"spec-draft-p-min = 0.0\n"
         if model.spec_mtp
         else ""

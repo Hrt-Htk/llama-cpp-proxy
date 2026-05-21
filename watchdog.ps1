@@ -11,13 +11,17 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path $PSCommandPath -Parent
 $python    = Join-Path $scriptDir ".venv\Scripts\python.exe"
 $proxy     = Join-Path $scriptDir "proxy.py"
-$logFile   = Join-Path $scriptDir "watchdog.log"
+$logRoot   = Join-Path $scriptDir "logs"
+
+. (Join-Path $scriptDir "log_paths.ps1")
 
 if (-not (Test-Path $python)) { throw "Python not found at $python" }
 if (-not (Test-Path $proxy))  { throw "proxy.py not found at $proxy" }
 
 function Log($msg) {
-    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
+    $date = Get-Date -Format "yyyy-MM-dd"
+    $logFile = Get-WeeklyLogPath -Root $logRoot -Name "watchdog-$date.log"
+    $line = "[{0}] {1}" -f (Get-LocalTimestamp), $msg
     Write-Host $line
     Add-Content -Path $logFile -Value $line
 }

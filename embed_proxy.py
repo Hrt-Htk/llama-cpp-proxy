@@ -9,10 +9,17 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+
+from log_paths import (
+    DATE_FMT,
+    LocalTzFormatter,
+    current_week_dir,
+    fmt_ts_full,
+    local_now,
+)
 
 # Enable ANSI escape sequences on Windows 10+
 if sys.platform == "win32":
@@ -75,11 +82,12 @@ class ProxyConfig:
 
     @property
     def server_command(self) -> list[str]:
-        log_file = ROOT / "logs" / f"embed-server-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
-        log_file.parent.mkdir(exist_ok=True)
+        log_file = current_week_dir(ROOT / "logs") / f"embed-server-{local_now().strftime(DATE_FMT)}.log"
         return [
             str(SERVER_EXE),
             "--log-file", str(log_file),
+            "--log-timestamps",
+            "--log-prefix",
             "--models-preset", str(PRESET_PATH),
             "--models-max", "1",
             "--no-models-autoload",
@@ -125,7 +133,10 @@ class ModelManager:
         if self.server_running:
             return
         logging.info(
-            "Starting embed router on %s:%s", self.config.server_host, self.config.server_port,
+            "Starting embed router on %s:%s | boot_ts=%s",
+            self.config.server_host,
+            self.config.server_port,
+            fmt_ts_full(),
         )
         self.process = await asyncio.create_subprocess_exec(
             *self.config.server_command, cwd=str(ROOT),
@@ -251,10 +262,9 @@ def write_preset() -> None:
 
 def configure_logging() -> None:
     log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"embed-proxy-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
-    logging.Formatter.converter = time.gmtime
-    fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
+    week_dir = current_week_dir(log_dir)
+    log_file = week_dir / f"embed-proxy-{local_now().strftime(DATE_FMT)}.log"
+    fmt = LocalTzFormatter("%(asctime)s %(levelname)s %(message)s")
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
