@@ -140,6 +140,9 @@ class ModelManager:
         )
         self.process = await asyncio.create_subprocess_exec(
             *self.config.server_command, cwd=str(ROOT),
+            # Pin to the 3090 Ti (GPU 0); hide the 2070 so layers aren't
+            # split onto its 8 GB and OOM/slow the embedder.
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
         )
         deadline = time.monotonic() + self.config.boot_timeout
         while time.monotonic() < deadline:
