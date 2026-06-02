@@ -90,6 +90,12 @@ HEALTH_POLL_INTERVAL = 1.0
 BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
+# In router mode llama-server runs the model in a child worker process and
+# proxies to it. If that child dies the parent stays up but every inference
+# request returns 5xx ("Could not establish connection") forever — nothing
+# respawns the child. We detect that and restart the router; this caps how
+# often, so a model that crashes on load can't put us in a restart loop.
+RECOVERY_MIN_INTERVAL = 45
 API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
 
 HOP_BY_HOP_HEADERS = {
@@ -255,6 +261,11 @@ class ModelManager:
         self._forwarding = 0
         self._idle_forward = asyncio.Event()
         self._idle_forward.set()  # set == no forwards in flight
+        # Dead-child recovery: bumped each time we restart the router so a
+        # burst of failing requests coalesces into a single restart.
+        self._recover_gen = 0
+        self._last_recover = 0.0
+        self._bg_tasks: set[asyncio.Task] = set()
 
     @property
     def server_running(self) -> bool:
@@ -452,6 +463,55 @@ class ModelManager:
         idle = time.monotonic() - self._last_activity
         if idle >= self.config.idle_timeout:
             await self.unload(f"idle for {int(idle)}s")
+
+    @property
+    def recover_gen(self) -> int:
+        return self._recover_gen
+
+    def trigger_recovery(self, model: str) -> None:
+        """Schedule a background router restart after a dead-child 5xx.
+
+        Fire-and-forget so the failing request returns its 5xx immediately;
+        pi retries automatically and that retry blocks on _load_lock until the
+        restart+reload below completes, then lands on a healthy worker. We
+        snapshot the generation now so concurrent failures coalesce.
+        """
+        gen = self._recover_gen
+        task = asyncio.create_task(self._recover(model, gen))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _recover(self, model: str, seen_gen: int) -> None:
+        """Restart the router process and reload *model*.
+
+        A dead child leaves the router reporting the model as still "loaded",
+        so a plain unload/reload can no-op ("already running"). Restarting the
+        router process is the deterministic fix; proxy.py (and thus the tunnel)
+        stays up across it. Coalesced via seen_gen and rate-limited so a model
+        that crashes on load can't trigger a restart loop.
+        """
+        async with self._load_lock:
+            if self._recover_gen != seen_gen:
+                return  # another failing request already recovered this gen
+            now = time.monotonic()
+            if now - self._last_recover < RECOVERY_MIN_INTERVAL:
+                logging.warning(
+                    "Skipping recovery for %s (router restarted %.0fs ago)",
+                    model, now - self._last_recover,
+                )
+                return
+            logging.warning("Router child unreachable; restarting router and reloading %s", model)
+            self._recover_gen += 1
+            self._last_recover = now
+            self._loaded = None
+            self._invalidate_cache()
+            try:
+                await self.stop_server()
+                await self.start_server()
+                await self._switch_and_load_locked(model)
+                logging.info("Recovery complete; %s reloaded", model)
+            except Exception:
+                logging.exception("recovery of %s failed (router restart/reload)", model)
 
 
 RAW_BODY_CAP = 1024 * 1024
@@ -976,6 +1036,8 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             )
         return downstream
 
+    recovery_model: str | None = None  # set on the inference path so the
+    # ClientError handler below can recover from a router-unreachable failure
     try:
         path = effective_path.rstrip("/")
         if path in ("/models/load", "/v1/models/load") and request.method == "POST":
@@ -998,14 +1060,28 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             # register as an in-flight forwarder so a concurrent model switch
             # waits for this stream to finish before evicting.
             model = _model_from_body(body, manager.config.default_model)
+            recovery_model = model
             async with manager.use_model(model):
-                return await _forward()
+                response = await _forward()
+            # A dead router child surfaces as an upstream 5xx with nothing
+            # streamed. Restart the router + reload in the background so the
+            # client's automatic retry lands on a healthy worker instead of
+            # looping 500s forever (coalesced + rate-limited in _recover).
+            if response.status >= 500:
+                logging.warning("[req=%s] upstream %s on %s; scheduling recovery",
+                                req_id, response.status, model)
+                manager.trigger_recovery(model)
+            return response
         else:
             # Catch-all passthrough (e.g. /v1/models, /health, etc.) — no model
             # load needed, forward directly without acquiring any lock.
             return await _forward()
     except ClientError as exc:
         logging.exception("[req=%s] proxy failure", req_id)
+        # Couldn't even reach the router on an inference request — same
+        # dead-worker family as an upstream 5xx; recover so the retry works.
+        if recovery_model is not None:
+            manager.trigger_recovery(recovery_model)
         return web.json_response(
             {"error": "bad gateway", "detail": str(exc)},
             status=502, headers={"X-Request-ID": req_id},
@@ -1242,6 +1318,8 @@ async def lifecycle_context(app: web.Application):
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
+        for task in list(manager._bg_tasks):
+            task.cancel()
         await manager.stop_server()
         with contextlib.suppress(Exception):
             await session.close()
