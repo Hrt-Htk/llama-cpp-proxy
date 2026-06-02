@@ -91,6 +91,14 @@ BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
 MIN_RESIDENCY = 8.0  # minimum seconds a loaded model is kept before an eviction is allowed
+# Lowercased substrings that identify a dead-worker 500 from the router.
+# The router returns these when its HTTP client can't reach the worker child.
+DEAD_WORKER_MARKERS: tuple[str, ...] = (
+    "could not establish connection",
+    "failed to read connection",
+    "failed to write connection",
+    "http client error",
+)
 API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
 
 HOP_BY_HOP_HEADERS = {
@@ -103,6 +111,24 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+class DeadWorkerError(Exception):
+    """Raised when the router returns a 500 whose body indicates the worker
+    child has died. Caught by proxy_request to trigger a recovery + retry."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self.body = body
+        super().__init__(f"dead-worker {status}: {body[:200]!r}")
+
+
+def _is_dead_worker_response(status: int, body: bytes) -> bool:
+    """Return True when *status* ≥ 500 and *body* contains a dead-worker marker."""
+    if status < 500:
+        return False
+    lowered = body.lower()
+    return any(m.encode() in lowered for m in DEAD_WORKER_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -361,6 +387,151 @@ class ModelManager:
         except ClientError as e:
             logging.warning("unload error: %s", e)
         self._loaded = None
+
+    async def recover_worker(self, model: str, dead_detected_at: float) -> bool:
+        """Force-cycle the router worker for *model* after a dead-worker 500.
+
+        Acquires ``_load_lock`` so concurrent callers serialise. Only the
+        first caller actually cycles unload/load; subsequent callers whose
+        ``dead_detected_at`` is before a recent ``_loaded_at`` know a peer
+        already completed recovery and return True immediately.
+
+        NOTE: We do NOT check the router's ``_status()`` to skip the cycle —
+        the router can report ``loaded`` while the worker child is already
+        dead. We always force an unload+reload on the first caller.
+
+        Returns True when the worker is confirmed loaded, False on timeout/
+        error so the caller can return 503.
+        """
+        async with self._load_lock:
+            # Re-check: if _loaded_at was updated AFTER the dead-worker was
+            # detected, a peer coroutine already completed recovery.
+            if self._loaded == model and self._loaded_at > dead_detected_at:
+                logging.info(
+                    "[recover_worker] %s already recovered by peer (loaded_at=%.3f > detected=%.3f)",
+                    model, self._loaded_at, dead_detected_at,
+                )
+                return True
+
+            logging.warning(
+                "[recover_worker] cycling unload/load for dead worker %s", model
+            )
+            self._loaded = None  # invalidate proxy cache immediately
+
+            # Unload — force the router to tear down the dead worker entry.
+            # Best-effort: the router may error if it can't contact the child,
+            # but we continue to the load step regardless.
+            url_unload = f"{self.config.backend_base_url}/models/unload"
+            auth_headers = {
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            }
+            try:
+                async with self.session.post(
+                    url_unload, headers=auth_headers, json={"model": model},
+                    timeout=ClientTimeout(total=10),
+                ) as r:
+                    body_text = await r.text()
+                    if r.status >= 400:
+                        logging.warning("[recover_worker] unload returned %s: %s", r.status, body_text)
+                    else:
+                        logging.info("[recover_worker] unload OK for %s", model)
+            except (ClientError, asyncio.TimeoutError) as e:
+                logging.warning("[recover_worker] unload error (ignored): %s", e)
+
+            # Wait for the router to reflect the unloaded state so that
+            # _switch_and_load_locked doesn't see "loaded" and short-circuit.
+            unload_deadline = time.monotonic() + 15
+            while time.monotonic() < unload_deadline:
+                try:
+                    status = await self._status(model)
+                    if status != "loaded":
+                        logging.info("[recover_worker] router confirms %s is %s", model, status)
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            else:
+                logging.warning(
+                    "[recover_worker] router still shows loaded after 15s — proceeding anyway"
+                )
+
+            # Reload — spawn fresh worker(s), draining any buffered exit
+            # signals the router queued during unload. Each exit signal
+            # consumes exactly one fresh worker; we loop until the worker
+            # stays alive for a full second after reporting "loaded".
+            #
+            # We do NOT use _switch_and_load_locked here because its poll
+            # loops until "loaded" is observed — if a queued exit fires
+            # between the worker reporting ready and our next poll (< 500 ms),
+            # the status flips to "unloaded" and the loop spins for 300 s.
+            # Instead we implement a custom load + rapid-poll that detects
+            # the loaded→unloaded flash and retries the load immediately.
+            load_url = f"{self.config.backend_base_url}/models/load"
+            max_load_attempts = 4
+            per_load_timeout = 60  # seconds to wait for status != "loading"
+
+            for load_attempt in range(1, max_load_attempts + 1):
+                logging.info(
+                    "[recover_worker] load attempt %d/%d for %s",
+                    load_attempt, max_load_attempts, model,
+                )
+                try:
+                    async with self.session.post(
+                        load_url, headers=auth_headers, json={"model": model},
+                        timeout=ClientTimeout(total=10),
+                    ) as r:
+                        body_text = await r.text()
+                        if r.status >= 400 and "already running" not in body_text:
+                            logging.warning("[recover_worker] load returned %s: %s", r.status, body_text)
+                except (ClientError, asyncio.TimeoutError) as e:
+                    logging.error("[recover_worker] load POST failed: %s", e)
+                    return False
+
+                # Poll until status leaves "loading" (either loaded or unloaded)
+                poll_deadline = time.monotonic() + per_load_timeout
+                prev_status = ""
+                while time.monotonic() < poll_deadline:
+                    try:
+                        status = await self._status(model)
+                    except Exception:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if status != prev_status:
+                        logging.info("[recover_worker] %s status: %s", model, status)
+                        prev_status = status
+                    if status == "loaded":
+                        # Give the router 1.5s to process any pending exit signal
+                        # before declaring victory.
+                        await asyncio.sleep(1.5)
+                        status2 = await self._status(model)
+                        if status2 == "loaded":
+                            self._loaded = model
+                            self._loaded_at = time.monotonic()
+                            logging.info(
+                                "[recover_worker] worker stable for %s (attempt %d)",
+                                model, load_attempt,
+                            )
+                            return True
+                        logging.warning(
+                            "[recover_worker] fresh worker for %s exited immediately "
+                            "(status after 1.5s: %s, attempt %d/%d)",
+                            model, status2, load_attempt, max_load_attempts,
+                        )
+                        break  # queued exit consumed — try next load attempt
+                    if status == "failed":
+                        logging.error("[recover_worker] model %s failed to load", model)
+                        return False
+                    await asyncio.sleep(0.25)
+                else:
+                    logging.error(
+                        "[recover_worker] timed out waiting for %s to load (attempt %d)",
+                        model, load_attempt,
+                    )
+                    return False
+
+            logging.error("[recover_worker] all %d load attempts failed for %s", max_load_attempts, model)
+            return False
 
     async def _status(self, model: str) -> str:
         url = f"{self.config.backend_base_url}/v1/models"
@@ -867,12 +1038,50 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
     headers = filter_request_headers(request.headers, manager.config.api_key)
 
     async def _do_forward() -> web.StreamResponse:
-        """Inner forward/stream; called from within use_model or directly."""
+        """Inner forward/stream; called from within use_model or directly.
+
+        For non-SSE responses with status >= 500 the body is pre-read so we
+        can detect a dead-worker error BEFORE committing the response to the
+        client via ``downstream.prepare()``. If a dead-worker marker is found
+        a ``DeadWorkerError`` is raised for the caller to handle. All other
+        paths (success, 4xx, SSE) stream zero-copy as before.
+        """
         try:
             upstream_resp = await session.request(
                 request.method, target_url, headers=headers,
                 data=body, allow_redirects=False, timeout=None,
             )
+            is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
+
+            # Pre-read non-SSE error bodies BEFORE prepare() so we can inspect
+            # them and raise DeadWorkerError without having committed headers.
+            if upstream_resp.status >= 500 and not is_sse:
+                error_body = await upstream_resp.content.read()
+                if _is_dead_worker_response(upstream_resp.status, error_body):
+                    raise DeadWorkerError(upstream_resp.status, error_body)
+                # Real (non-dead-worker) 5xx — forward as-is.
+                response_headers = filter_response_headers(upstream_resp.headers)
+                response_headers["X-Request-ID"] = req_id
+                downstream = web.StreamResponse(
+                    status=upstream_resp.status, reason=upstream_resp.reason,
+                    headers=response_headers,
+                )
+                await downstream.prepare(request)
+                try:
+                    await downstream.write(error_body)
+                except ConnectionResetError:
+                    logging.info("[req=%s] client disconnected", req_id)
+                finally:
+                    with contextlib.suppress(ConnectionResetError, RuntimeError):
+                        await downstream.write_eof()
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    logging.info(
+                        "[req=%s] %s %s %s -> %s in %dms",
+                        req_id, client_ip(request), request.method, request.rel_url,
+                        downstream.status, duration_ms,
+                    )
+                    return downstream
+
             response_headers = filter_response_headers(upstream_resp.headers)
             response_headers["X-Request-ID"] = req_id
             downstream = web.StreamResponse(
@@ -880,7 +1089,6 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             )
             await downstream.prepare(request)
             try:
-                is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
                 if is_sse and chat_logger:
                     wrapped = SSEChunkLogger(upstream_resp, chat_logger)
                     while True:
@@ -917,6 +1125,8 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                     downstream.status, duration_ms,
                 )
                 return downstream
+        except DeadWorkerError:
+            raise  # propagate to retry loop
         except ClientError as exc:
             logging.exception("[req=%s] proxy failure", req_id)
             return web.json_response(
@@ -928,16 +1138,42 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         if needs_model:
             # Wrap the entire forward inside use_model so _end_forward() only
             # fires after the stream is fully drained — no eviction mid-stream.
-            try:
-                async with manager.use_model(model):
-                    return await _do_forward()
-            except Exception as exc:
-                logging.exception("[req=%s] backend unavailable", req_id)
-                return web.json_response(
-                    {"error": "backend unavailable", "detail": str(exc)},
-                    status=503,
-                    headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
-                )
+            # Up to 2 attempts: on DeadWorkerError, recover then retry once.
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async with manager.use_model(model):
+                        return await _do_forward()
+                except DeadWorkerError as exc:
+                    dead_detected_at = time.monotonic()
+                    logging.warning(
+                        "[req=%s] dead-worker 500 on attempt %d/%d — body: %r",
+                        req_id, attempt, max_attempts, exc.body[:200],
+                    )
+                    if attempt < max_attempts:
+                        recovered = await manager.recover_worker(model, dead_detected_at)
+                        if not recovered:
+                            logging.error("[req=%s] worker recovery failed — giving up", req_id)
+                            return web.json_response(
+                                {"error": "backend unavailable", "detail": "worker recovery failed"},
+                                status=503,
+                                headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
+                            )
+                        logging.info("[req=%s] worker recovered — retrying request", req_id)
+                    else:
+                        logging.error("[req=%s] dead worker persists after recovery — 503", req_id)
+                        return web.json_response(
+                            {"error": "backend unavailable", "detail": "dead worker after recovery"},
+                            status=503,
+                            headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
+                        )
+                except Exception as exc:
+                    logging.exception("[req=%s] backend unavailable", req_id)
+                    return web.json_response(
+                        {"error": "backend unavailable", "detail": str(exc)},
+                        status=503,
+                        headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
+                    )
         else:
             # Non-model endpoints (health, /v1/models, props, …) forward directly.
             return await _do_forward()
