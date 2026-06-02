@@ -90,12 +90,7 @@ HEALTH_POLL_INTERVAL = 1.0
 BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
-# In router mode llama-server runs the model in a child worker process and
-# proxies to it. If that child dies the parent stays up but every inference
-# request returns 5xx ("Could not establish connection") forever — nothing
-# respawns the child. We detect that and restart the router; this caps how
-# often, so a model that crashes on load can't put us in a restart loop.
-RECOVERY_MIN_INTERVAL = 45
+MIN_RESIDENCY = 8.0  # minimum seconds a loaded model is kept before an eviction is allowed
 API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
 
 HOP_BY_HOP_HEADERS = {
@@ -108,80 +103,6 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
-
-PROBE_CACHE_TTL = 3.0  # seconds to cache /models and /props responses
-
-
-@dataclass
-class _CacheEntry:
-    """A single cached probe response."""
-    status: int
-    body: bytes
-    content_type: str
-    expires: float  # monotonic time
-
-
-class ResponseCache:
-    """TTL + single-flight cache for probe endpoints (/models, /props).
-
-    Single-flight: when the cached entry is missing or stale, only ONE
-    upstream fetch runs; all concurrent callers sharing the same key await
-    that single coroutine and receive the same result. This collapses the
-    burst of parallel probe requests from the pi extension into one real
-    upstream call per TTL window.
-
-    Keys are ``(effective_path, query_string)`` tuples.
-    """
-
-    def __init__(self, ttl: float = PROBE_CACHE_TTL) -> None:
-        self._ttl = ttl
-        self._entries: dict[tuple[str, str], _CacheEntry] = {}
-        # Per-key lock: serialises the miss-path so only one fetch runs.
-        self._key_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # Generation counter — invalidate() bumps this and wipes entries.
-        self._generation: int = 0
-
-    def _get_lock(self, key: tuple[str, str]) -> asyncio.Lock:
-        if key not in self._key_locks:
-            self._key_locks[key] = asyncio.Lock()
-        return self._key_locks[key]
-
-    def invalidate(self) -> None:
-        """Flush all cached entries (called on model load/unload transitions)."""
-        self._entries.clear()
-        self._generation += 1
-        logging.debug("ResponseCache invalidated (gen=%d)", self._generation)
-
-    async def get_or_fetch(
-        self,
-        key: tuple[str, str],
-        fetch_fn,  # async callable () -> _CacheEntry
-    ) -> _CacheEntry:
-        """Return a cached entry if fresh, otherwise run ``fetch_fn`` once."""
-        now = time.monotonic()
-        entry = self._entries.get(key)
-        if entry is not None and entry.expires > now:
-            return entry
-
-        lock = self._get_lock(key)
-        async with lock:
-            # Double-checked locking: another waiter may have filled the cache
-            # while we were waiting for the lock.
-            now = time.monotonic()
-            entry = self._entries.get(key)
-            if entry is not None and entry.expires > now:
-                return entry
-
-            gen = self._generation
-            entry = await fetch_fn()
-            # Don't cache if (a) the fetch opted out via a negative expires
-            # sentinel (e.g. an upstream error response), or (b) an
-            # invalidate() landed while this fetch was in flight — storing
-            # would resurrect pre-transition state for a full TTL window.
-            if entry.expires >= 0.0 and self._generation == gen:
-                entry.expires = time.monotonic() + self._ttl
-                self._entries[key] = entry
-            return entry
 
 
 @dataclass(frozen=True)
@@ -242,30 +163,18 @@ class ModelManager:
     itself stays up so the cloudflared tunnel never breaks.
     """
 
-    def __init__(
-        self,
-        config: ProxyConfig,
-        session: ClientSession,
-        cache: ResponseCache | None = None,
-    ) -> None:
+    def __init__(self, config: ProxyConfig, session: ClientSession) -> None:
         self.config = config
         self.session = session
-        self.cache = cache
         self.process: asyncio.subprocess.Process | None = None
         self._loaded: str | None = None  # alias of currently-loaded model, None if nothing
         self._load_lock = asyncio.Lock()
         self._active = 0
         self._last_activity = time.monotonic()
-        # Forward-tracking: count of requests currently streaming against the
-        # loaded model.  Used to drain in-flight forwards before evicting.
-        self._forwarding = 0
-        self._idle_forward = asyncio.Event()
-        self._idle_forward.set()  # set == no forwards in flight
-        # Dead-child recovery: bumped each time we restart the router so a
-        # burst of failing requests coalesces into a single restart.
-        self._recover_gen = 0
-        self._last_recover = 0.0
-        self._bg_tasks: set[asyncio.Task] = set()
+        self._forwarding: int = 0  # count of requests currently streaming
+        self._idle_forward: asyncio.Event = asyncio.Event()
+        self._idle_forward.set()  # set == 0 in-flight (idle)
+        self._loaded_at: float = 0.0  # monotonic time the current model finished loading
 
     @property
     def server_running(self) -> bool:
@@ -288,16 +197,15 @@ class ModelManager:
         self._last_activity = time.monotonic()
 
     def _begin_forward(self) -> None:
-        """Register one in-flight forward.  Must be called while holding _load_lock."""
+        """Register a new in-flight streaming request."""
         self._forwarding += 1
-        if self._forwarding == 1:
-            self._idle_forward.clear()
+        self._idle_forward.clear()  # not idle while a request is streaming
 
     def _end_forward(self) -> None:
-        """Deregister one in-flight forward (call from finally, outside any lock)."""
+        """Deregister a completed streaming request."""
         self._forwarding = max(0, self._forwarding - 1)
         if self._forwarding == 0:
-            self._idle_forward.set()
+            self._idle_forward.set()  # signal idle to any waiting switcher
 
     async def start_server(self) -> None:
         if self.server_running:
@@ -347,35 +255,24 @@ class ModelManager:
         self.process = None
         self._loaded = None
 
-    def _invalidate_cache(self) -> None:
-        if self.cache is not None:
-            self.cache.invalidate()
-
     async def _switch_and_load_locked(self, model: str) -> None:
-        """Load *model* into the router.  Caller MUST already hold _load_lock.
+        """Load *model* into the router. Caller MUST already hold ``_load_lock``.
 
-        If a different model is currently loaded this method drains all
-        in-flight forwards against it before issuing the evicting /models/load.
-        Because _begin_forward() is only ever called while _load_lock is held
-        (inside use_model), no new forwarder can register while we hold the
-        lock and wait on _idle_forward — existing forwarders are past the lock
-        and will drain naturally to zero.
+        Syncs cached ``_loaded`` state from the router before issuing a load
+        to avoid spurious "already running" 400s, then polls until the model
+        reports ``loaded`` or a timeout expires. Sets ``_loaded_at`` on every
+        successful load so the residency window starts fresh.
         """
         if self._loaded == model:
             return
-        # The router may already have the model loaded (e.g. a client called
-        # /models/load directly through the proxy). Sync state before issuing
+        # Sync state: the router may already have this model loaded (e.g. a
+        # direct /models/load call through the proxy). Check before issuing
         # another load — otherwise the router returns 400 "already running".
         current_status = await self._status(model)
         if current_status == "loaded":
             self._loaded = model
-            self._invalidate_cache()
+            self._loaded_at = time.monotonic()
             return
-        # Drain any in-flight forwards on the *current* model before evicting.
-        # With --models-max 1, loading a new model immediately evicts the old
-        # one; a request mid-stream against the evicted model would 500.
-        if self._loaded is not None:
-            await self._idle_forward.wait()
         logging.info("Loading model: %s", model)
         url = f"{self.config.backend_base_url}/models/load"
         headers = {
@@ -387,7 +284,7 @@ class ModelManager:
                 body = await r.text()
                 if "already running" in body:
                     self._loaded = model
-                    self._invalidate_cache()
+                    self._loaded_at = time.monotonic()
                     return
                 raise RuntimeError(f"load returned {r.status}: {body}")
         deadline = time.monotonic() + LOAD_TIMEOUT
@@ -395,8 +292,8 @@ class ModelManager:
             status = await self._status(model)
             if status == "loaded":
                 self._loaded = model
+                self._loaded_at = time.monotonic()
                 logging.info("Model loaded: %s", model)
-                self._invalidate_cache()
                 return
             if status == "failed":
                 raise RuntimeError(f"model {model} failed to load")
@@ -404,22 +301,44 @@ class ModelManager:
         raise TimeoutError(f"model {model} did not load in {LOAD_TIMEOUT}s")
 
     async def ensure_loaded(self, model: str) -> None:
-        """Public load entry-point for the explicit /models/load proxy path."""
+        """Ensure *model* is loaded. Acquires ``_load_lock`` internally.
+
+        Used by explicit ``/models/load`` proxy pass-through so that a direct
+        client load request goes through the same serialisation path.
+        """
         async with self._load_lock:
             await self._switch_and_load_locked(model)
 
     @contextlib.asynccontextmanager
     async def use_model(self, model: str):
-        """Async context manager for chat forwarding.
+        """Async context manager that ensures *model* is loaded for the duration
+        of a streaming forward, preventing mid-stream eviction.
 
-        Loads *model* if needed (serialised via _load_lock), registers the
-        caller as an in-flight forwarder *before* releasing the lock so that a
-        concurrent switch cannot evict the model mid-stream, then yields.
-        _end_forward() is always called in the finally block.
+        Acquiring ``_load_lock`` for a switch:
+        1. DRAIN — waits for all currently-streaming requests to finish before
+           evicting the old model (``_idle_forward`` is only set when
+           ``_forwarding == 0``).
+        2. MIN-RESIDENCY — after a fresh load, waits out the remainder of
+           ``MIN_RESIDENCY`` seconds before allowing another eviction, preventing
+           rapid ping-pong reloads by concurrent agents on different models.
+
+        ``_begin_forward()`` is called while the lock is still held so the
+        counter increment is atomic with respect to any concurrent switcher.
         """
         async with self._load_lock:
-            await self._switch_and_load_locked(model)
-            self._begin_forward()  # atomic vs a switch: registered under the lock
+            if self._loaded != model:
+                # DRAIN: never evict a model that has an in-flight request.
+                # _begin_forward() only runs under _load_lock, so no new
+                # forward can sneak in while we are deciding to switch.
+                if self._loaded is not None:
+                    await self._idle_forward.wait()
+                # MIN-RESIDENCY: don't evict a model loaded less than
+                # MIN_RESIDENCY seconds ago; wait out the remainder.
+                wait = MIN_RESIDENCY - (time.monotonic() - self._loaded_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                await self._switch_and_load_locked(model)
+            self._begin_forward()  # register UNDER the lock — atomic vs a switch
         try:
             yield
         finally:
@@ -442,7 +361,6 @@ class ModelManager:
         except ClientError as e:
             logging.warning("unload error: %s", e)
         self._loaded = None
-        self._invalidate_cache()
 
     async def _status(self, model: str) -> str:
         url = f"{self.config.backend_base_url}/v1/models"
@@ -458,60 +376,12 @@ class ModelManager:
         return "unknown"
 
     async def unload_if_idle(self) -> None:
-        if self._active != 0 or self._loaded is None:
+        # Never unload while a streaming forward is in progress.
+        if self._active != 0 or self._forwarding != 0 or self._loaded is None:
             return
         idle = time.monotonic() - self._last_activity
         if idle >= self.config.idle_timeout:
             await self.unload(f"idle for {int(idle)}s")
-
-    @property
-    def recover_gen(self) -> int:
-        return self._recover_gen
-
-    def trigger_recovery(self, model: str) -> None:
-        """Schedule a background router restart after a dead-child 5xx.
-
-        Fire-and-forget so the failing request returns its 5xx immediately;
-        pi retries automatically and that retry blocks on _load_lock until the
-        restart+reload below completes, then lands on a healthy worker. We
-        snapshot the generation now so concurrent failures coalesce.
-        """
-        gen = self._recover_gen
-        task = asyncio.create_task(self._recover(model, gen))
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
-
-    async def _recover(self, model: str, seen_gen: int) -> None:
-        """Restart the router process and reload *model*.
-
-        A dead child leaves the router reporting the model as still "loaded",
-        so a plain unload/reload can no-op ("already running"). Restarting the
-        router process is the deterministic fix; proxy.py (and thus the tunnel)
-        stays up across it. Coalesced via seen_gen and rate-limited so a model
-        that crashes on load can't trigger a restart loop.
-        """
-        async with self._load_lock:
-            if self._recover_gen != seen_gen:
-                return  # another failing request already recovered this gen
-            now = time.monotonic()
-            if now - self._last_recover < RECOVERY_MIN_INTERVAL:
-                logging.warning(
-                    "Skipping recovery for %s (router restarted %.0fs ago)",
-                    model, now - self._last_recover,
-                )
-                return
-            logging.warning("Router child unreachable; restarting router and reloading %s", model)
-            self._recover_gen += 1
-            self._last_recover = now
-            self._loaded = None
-            self._invalidate_cache()
-            try:
-                await self.stop_server()
-                await self.start_server()
-                await self._switch_and_load_locked(model)
-                logging.info("Recovery complete; %s reloaded", model)
-            except Exception:
-                logging.exception("recovery of %s failed (router restart/reload)", model)
 
 
 RAW_BODY_CAP = 1024 * 1024
@@ -964,17 +834,28 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
 
     effective_path = _strip_chat_prefix(request.path)
 
+    # Determine whether this request requires a model and parse the body up front.
+    # Body parsing errors (OOM, malformed) become 503 so clients get Retry-After.
     try:
         body = await request.read() if request.can_read_body else None
         body = _inject_cache_prompt(body, request.method, effective_path)
     except Exception as exc:
-        logging.exception("[req=%s] failed to read request body", req_id)
+        logging.exception("[req=%s] body read failed", req_id)
         manager.end_request()
         return web.json_response(
             {"error": "backend unavailable", "detail": str(exc)},
             status=503,
             headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
         )
+
+    path = effective_path.rstrip("/")
+    needs_model = path in (
+        "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+        "/chat/completions", "/completions", "/embeddings",
+    )
+    model: str | None = None
+    if needs_model:
+        model = _model_from_body(body, manager.config.default_model)
 
     if chat_logger is not None:
         await chat_logger.log_request(request.method, request.path, body, req_id)
@@ -985,114 +866,81 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         target_url = f"{target_url}?{query}"
     headers = filter_request_headers(request.headers, manager.config.api_key)
 
-    async def _forward() -> web.StreamResponse:
-        """Forward the prepared request to llama-server and stream the response."""
-        upstream_resp = await session.request(
-            request.method, target_url, headers=headers,
-            data=body, allow_redirects=False, timeout=None,
-        )
-        response_headers = filter_response_headers(upstream_resp.headers)
-        response_headers["X-Request-ID"] = req_id
-        downstream = web.StreamResponse(
-            status=upstream_resp.status, reason=upstream_resp.reason, headers=response_headers,
-        )
-        await downstream.prepare(request)
+    async def _do_forward() -> web.StreamResponse:
+        """Inner forward/stream; called from within use_model or directly."""
         try:
-            is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
-            if is_sse and chat_logger:
-                wrapped = SSEChunkLogger(upstream_resp, chat_logger)
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(wrapped.readany(), timeout=25)
-                    except asyncio.TimeoutError:
-                        await downstream.write(b": keep-alive\n\n")
-                        continue
-                    if not chunk:
-                        break
-                    await downstream.write(chunk)
-            elif is_sse:
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(upstream_resp.content.readany(), timeout=25)
-                    except asyncio.TimeoutError:
-                        await downstream.write(b": keep-alive\n\n")
-                        continue
-                    if not chunk:
-                        break
-                    await downstream.write(chunk)
-            else:
-                async for chunk in upstream_resp.content.iter_any():
-                    await downstream.write(chunk)
-        except ConnectionResetError:
-            logging.info("[req=%s] client disconnected", req_id)
-        finally:
-            with contextlib.suppress(ConnectionResetError, RuntimeError):
-                await downstream.write_eof()
-            duration_ms = int((time.monotonic() - started) * 1000)
-            logging.info(
-                "[req=%s] %s %s %s -> %s in %dms",
-                req_id, client_ip(request), request.method, request.rel_url,
-                downstream.status, duration_ms,
+            upstream_resp = await session.request(
+                request.method, target_url, headers=headers,
+                data=body, allow_redirects=False, timeout=None,
             )
-        return downstream
-
-    recovery_model: str | None = None  # set on the inference path so the
-    # ClientError handler below can recover from a router-unreachable failure
-    try:
-        path = effective_path.rstrip("/")
-        if path in ("/models/load", "/v1/models/load") and request.method == "POST":
-            # Explicit client load: serialise via _load_lock, don't forward.
-            # With --models-max 1 a racing /models/load can evict a still-loading
-            # instance -> force-kill (status 99) -> 500 storm.
-            # ensure_loaded queues under _load_lock so concurrent callers wait.
-            # We must NOT forward again (router would say "already running").
-            model = _model_from_body(body, manager.config.default_model)
-            await manager.ensure_loaded(model)
+            response_headers = filter_response_headers(upstream_resp.headers)
+            response_headers["X-Request-ID"] = req_id
+            downstream = web.StreamResponse(
+                status=upstream_resp.status, reason=upstream_resp.reason, headers=response_headers,
+            )
+            await downstream.prepare(request)
+            try:
+                is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
+                if is_sse and chat_logger:
+                    wrapped = SSEChunkLogger(upstream_resp, chat_logger)
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(wrapped.readany(), timeout=25)
+                        except asyncio.TimeoutError:
+                            await downstream.write(b": keep-alive\n\n")
+                            continue
+                        if not chunk:
+                            break
+                        await downstream.write(chunk)
+                elif is_sse:
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(upstream_resp.content.readany(), timeout=25)
+                        except asyncio.TimeoutError:
+                            await downstream.write(b": keep-alive\n\n")
+                            continue
+                        if not chunk:
+                            break
+                        await downstream.write(chunk)
+                else:
+                    async for chunk in upstream_resp.content.iter_any():
+                        await downstream.write(chunk)
+            except ConnectionResetError:
+                logging.info("[req=%s] client disconnected", req_id)
+            finally:
+                with contextlib.suppress(ConnectionResetError, RuntimeError):
+                    await downstream.write_eof()
+                duration_ms = int((time.monotonic() - started) * 1000)
+                logging.info(
+                    "[req=%s] %s %s %s -> %s in %dms",
+                    req_id, client_ip(request), request.method, request.rel_url,
+                    downstream.status, duration_ms,
+                )
+                return downstream
+        except ClientError as exc:
+            logging.exception("[req=%s] proxy failure", req_id)
             return web.json_response(
-                {"status": "loaded", "model": model},
-                headers={"X-Request-ID": req_id},
+                {"error": "bad gateway", "detail": str(exc)},
+                status=502, headers={"X-Request-ID": req_id},
             )
-        elif path in (
-            "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
-            "/chat/completions", "/completions", "/embeddings",
-        ):
-            # Model-bearing inference endpoints: ensure model is loaded and
-            # register as an in-flight forwarder so a concurrent model switch
-            # waits for this stream to finish before evicting.
-            model = _model_from_body(body, manager.config.default_model)
-            recovery_model = model
-            async with manager.use_model(model):
-                response = await _forward()
-            # A dead router child surfaces as an upstream 5xx with nothing
-            # streamed. Restart the router + reload in the background so the
-            # client's automatic retry lands on a healthy worker instead of
-            # looping 500s forever (coalesced + rate-limited in _recover).
-            if response.status >= 500:
-                logging.warning("[req=%s] upstream %s on %s; scheduling recovery",
-                                req_id, response.status, model)
-                manager.trigger_recovery(model)
-            return response
+
+    try:
+        if needs_model:
+            # Wrap the entire forward inside use_model so _end_forward() only
+            # fires after the stream is fully drained — no eviction mid-stream.
+            try:
+                async with manager.use_model(model):
+                    return await _do_forward()
+            except Exception as exc:
+                logging.exception("[req=%s] backend unavailable", req_id)
+                return web.json_response(
+                    {"error": "backend unavailable", "detail": str(exc)},
+                    status=503,
+                    headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
+                )
         else:
-            # Catch-all passthrough (e.g. /v1/models, /health, etc.) — no model
-            # load needed, forward directly without acquiring any lock.
-            return await _forward()
-    except ClientError as exc:
-        logging.exception("[req=%s] proxy failure", req_id)
-        # Couldn't even reach the router on an inference request — same
-        # dead-worker family as an upstream 5xx; recover so the retry works.
-        if recovery_model is not None:
-            manager.trigger_recovery(recovery_model)
-        return web.json_response(
-            {"error": "bad gateway", "detail": str(exc)},
-            status=502, headers={"X-Request-ID": req_id},
-        )
-    except Exception as exc:
-        logging.exception("[req=%s] backend unavailable", req_id)
-        return web.json_response(
-            {"error": "backend unavailable", "detail": str(exc)},
-            status=503,
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
-        )
+            # Non-model endpoints (health, /v1/models, props, …) forward directly.
+            return await _do_forward()
     finally:
         manager.end_request()
 
@@ -1107,61 +955,28 @@ async def models_handler(request: web.Request) -> web.Response:
     see `failed: true`, so a freshly-booted router shows every preset as
     "Retry" in pi. We rewrite the flag to false whenever `value` says the
     preset is simply unloaded — `value` is the source of truth.
-
-    Responses are cached for PROBE_CACHE_TTL seconds with single-flight
-    semantics to collapse the burst of parallel probe requests from the pi
-    extension into a single upstream fetch per TTL window.
     """
     manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
-    cache: ResponseCache | None = request.app.get("models_cache")
     effective_path = _strip_chat_prefix(request.path)
     query = request.rel_url.query_string
-    cache_key = (effective_path, query)
-
-    async def _fetch() -> _CacheEntry:
-        target_url = f"{manager.config.backend_base_url}{effective_path}"
-        if query:
-            target_url = f"{target_url}?{query}"
-        headers = filter_request_headers(request.headers, manager.config.api_key)
-        async with session.get(target_url, headers=headers) as upstream:
-            body_text = await upstream.text()
-            up_status = upstream.status
-            up_ct = upstream.content_type or "application/json"
+    target_url = f"{manager.config.backend_base_url}{effective_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
+    headers = filter_request_headers(request.headers, manager.config.api_key)
+    async with session.get(target_url, headers=headers) as upstream:
+        body_text = await upstream.text()
         try:
             payload = json.loads(body_text)
         except (ValueError, TypeError):
-            # JSON parse failure — return raw and opt out of caching (negative
-            # expires sentinel) so a transient non-JSON blip can't be pinned
-            # for a full TTL window.
-            return _CacheEntry(
-                status=up_status,
-                body=body_text.encode() if isinstance(body_text, str) else body_text,
-                content_type=up_ct,
-                expires=-1.0,
-            )
+            return web.Response(status=upstream.status, body=body_text,
+                                content_type=upstream.content_type or "application/json")
         for entry in payload.get("data") or []:
             status = entry.get("status")
             if isinstance(status, dict) and status.get("value") == "unloaded":
                 status["failed"] = False
                 status.pop("exit_code", None)
-        return _CacheEntry(
-            status=up_status,
-            body=json.dumps(payload).encode(),
-            content_type="application/json",
-            expires=0.0,  # set by get_or_fetch
-        )
-
-    if cache is not None:
-        cached = await cache.get_or_fetch(cache_key, _fetch)
-    else:
-        cached = await _fetch()
-
-    return web.Response(
-        status=cached.status,
-        body=cached.body,
-        content_type=cached.content_type,
-    )
+        return web.json_response(payload, status=upstream.status)
 
 
 async def props_handler(request: web.Request) -> web.Response:
@@ -1174,50 +989,26 @@ async def props_handler(request: web.Request) -> web.Response:
     parser can mis-classify that 400 response as FAILED (shows "Retry"
     instead of "Load & switch"). We rewrite to a clean 200 JSON whose
     shape matches the exact equality checks in baseModel.getStatus().
-
-    Responses are cached for PROBE_CACHE_TTL seconds with single-flight
-    semantics — see models_handler for the same pattern.
     """
     manager: ModelManager = request.app["manager"]
     session: ClientSession = request.app["session"]
-    cache: ResponseCache | None = request.app.get("models_cache")
     effective_path = _strip_chat_prefix(request.path)
     query = request.rel_url.query_string
-    cache_key = (effective_path, query)
-
-    async def _fetch() -> _CacheEntry:
-        target_url = f"{manager.config.backend_base_url}{effective_path}"
-        if query:
-            target_url = f"{target_url}?{query}"
-        headers = filter_request_headers(request.headers, manager.config.api_key)
-        async with session.get(target_url, headers=headers) as upstream:
-            body_text = await upstream.text()
-            up_status = upstream.status
-            up_ct = upstream.content_type or "application/json"
-        if up_status == 400 and "model is not loaded" in body_text:
-            return _CacheEntry(
-                status=200,
-                body=json.dumps({"error": {"code": 400, "message": "model is not loaded"}}).encode(),
-                content_type="application/json",
-                expires=0.0,
+    target_url = f"{manager.config.backend_base_url}{effective_path}"
+    if query:
+        target_url = f"{target_url}?{query}"
+    headers = filter_request_headers(request.headers, manager.config.api_key)
+    async with session.get(target_url, headers=headers) as upstream:
+        body_text = await upstream.text()
+        if upstream.status == 400 and "model is not loaded" in body_text:
+            return web.json_response(
+                {"error": {"code": 400, "message": "model is not loaded"}}
             )
-        return _CacheEntry(
-            status=up_status,
-            body=body_text.encode() if isinstance(body_text, str) else body_text,
-            content_type=up_ct,
-            expires=0.0,
+        return web.Response(
+            status=upstream.status,
+            body=body_text,
+            content_type=upstream.content_type or "application/json",
         )
-
-    if cache is not None:
-        cached = await cache.get_or_fetch(cache_key, _fetch)
-    else:
-        cached = await _fetch()
-
-    return web.Response(
-        status=cached.status,
-        body=cached.body,
-        content_type=cached.content_type,
-    )
 
 
 async def embed_forward(request: web.Request) -> web.StreamResponse:
@@ -1300,13 +1091,11 @@ async def health_handler(request: web.Request) -> web.Response:
 
 async def lifecycle_context(app: web.Application):
     session = ClientSession(timeout=ClientTimeout(total=None))
-    models_cache = ResponseCache()
-    manager = ModelManager(app["config"], session, cache=models_cache)
+    manager = ModelManager(app["config"], session)
     chat_logger = ChatLogger(ROOT / "logs") if app["config"].chat_log else None
 
     app["session"] = session
     app["manager"] = manager
-    app["models_cache"] = models_cache
     app["chat_logger"] = chat_logger
 
     await manager.start_server()
@@ -1318,8 +1107,6 @@ async def lifecycle_context(app: web.Application):
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
-        for task in list(manager._bg_tasks):
-            task.cancel()
         await manager.stop_server()
         with contextlib.suppress(Exception):
             await session.close()
