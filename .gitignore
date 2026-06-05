@@ -22,6 +22,10 @@ __pycache__/
 *.log
 logs/
 
+# Auto-generated preset files (rewritten on startup)
+models-preset.ini
+embed-preset.ini
+
 # Local configs and secrets
 .claude/settings.local.json
 *.auth.json
