@@ -6,11 +6,11 @@ to the embed stack. Each proxy loads its model on first request and unloads afte
 10 minutes of inactivity — the router process stays up so the tunnel never breaks.
 
 ```
-ai.htk-hrt.cc/chat/*       → :8001 proxy.py     → :8002 router (chat)
-ai.htk-hrt.cc/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
+ai.example.com/chat/*       → :8001 proxy.py     → :8002 router (chat)
+ai.example.com/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
 ```
 
-Bare `ai.htk-hrt.cc/v1/...` at the root also still hits the chat router
+Bare `ai.example.com/v1/...` at the root also still hits the chat router
 (backwards compat); the `/chat` prefix is the preferred public alias.
 Both stacks run side-by-side as independent processes; both models can be loaded
 concurrently.
@@ -73,8 +73,8 @@ H:\llama.cpp\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768
 
 ## Endpoints
 
-- **Chat:** `https://ai.htk-hrt.cc/chat/v1/chat/completions` — model field selects preset (e.g. `qwen3.6-35b-q3-32k`).
-- **Embeddings:** `https://ai.htk-hrt.cc/embedding/v1/embeddings` — model `qwen3-embedding-4b-8k`.
+- **Chat:** `https://ai.example.com/chat/v1/chat/completions` — model field selects preset (e.g. `qwen3.6-35b-q3-32k`).
+- **Embeddings:** `https://ai.example.com/embedding/v1/embeddings` — model `qwen3-embedding-4b-8k`.
 - Both require `Authorization: Bearer <key>`. Set via `$env:LLAMA_API_KEY` (overrides the hardcoded fallback in the proxy code).
 
 `/health` on either port reports proxy + router state and which model is currently loaded.

@@ -99,7 +99,24 @@ DEAD_WORKER_MARKERS: tuple[str, ...] = (
     "failed to write connection",
     "http client error",
 )
-API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (non-overwrite)."""
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("\"'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv(ROOT / ".env")
+
+API_KEY = os.environ.get("LLAMA_API_KEY")
 
 HOP_BY_HOP_HEADERS = {
     "connection",

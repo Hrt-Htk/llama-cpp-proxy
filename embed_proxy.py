@@ -38,7 +38,7 @@ MODEL_ID = "qwen3-embedding-4b-8k"
 CTX_SIZE = 8192
 
 PROXY_HOST = "::"
-PROXY_PORT = 8003          # cloudflared origin (embed.htk-hrt.cc)
+PROXY_PORT = 8003          # cloudflared origin (embed.example.com)
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8004         # internal router
 IDLE_TIMEOUT = 600
@@ -47,7 +47,24 @@ HEALTH_POLL_INTERVAL = 1.0
 BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 120
 RETRY_AFTER_SECONDS = 30
-API_KEY = os.environ.get("LLAMA_API_KEY", "ZXY0UVZt8lbPVj3fSTC4gp0JatpRfOBQqGDAcvaVl3RjmWoq")
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (non-overwrite)."""
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("\"'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv(ROOT / ".env")
+
+API_KEY = os.environ.get("LLAMA_API_KEY")
 
 HOP_BY_HOP_HEADERS = {
     "connection",

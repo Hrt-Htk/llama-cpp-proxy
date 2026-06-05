@@ -31,6 +31,7 @@ embed-preset.ini
 *.auth.json
 auth.json
 api-key.txt
+.env
 
 # OS files
 .DS_Store

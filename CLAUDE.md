@@ -5,11 +5,11 @@ Cloudflared exposes them under a single hostname; `proxy.py` reverse-proxies
 `/embedding/*` to the embed stack on :8003.
 
 ```
-ai.htk-hrt.cc/chat/*       → :8001 proxy.py     → :8002 router (chat)
-ai.htk-hrt.cc/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
+ai.example.com/chat/*       → :8001 proxy.py     → :8002 router (chat)
+ai.example.com/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
 ```
 
-Bare `ai.htk-hrt.cc/v1/...` at the root also still hits the chat router
+Bare `ai.example.com/v1/...` at the root also still hits the chat router
 (backwards compat); the `/chat` prefix is the preferred public alias.
 
 ## Code
