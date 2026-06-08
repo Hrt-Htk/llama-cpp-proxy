@@ -486,7 +486,7 @@ class ModelManager:
             # the loaded→unloaded flash and retries the load immediately.
             load_url = f"{self.config.backend_base_url}/models/load"
             max_load_attempts = 4
-            per_load_timeout = 60  # seconds to wait for status != "loading"
+            per_load_timeout = 120  # seconds to wait for status != "loading"
 
             for load_attempt in range(1, max_load_attempts + 1):
                 logging.info(
@@ -542,10 +542,40 @@ class ModelManager:
                     await asyncio.sleep(0.25)
                 else:
                     logging.error(
-                        "[recover_worker] timed out waiting for %s to load (attempt %d)",
-                        model, load_attempt,
+                        "[recover_worker] timed out waiting for %s to load (attempt %d/%d)",
+                        model, load_attempt, max_load_attempts,
                     )
-                    return False
+                    # Don't return False here — let the for-loop try the next attempt.
+                    # The router may need a fresh /models/load POST to clear a stuck
+                    # "loading" state from a previous crash.
+                    # Retry the unload to give the router a chance to tear down
+                    # any zombie worker entry from the timed-out attempt.
+                    if load_attempt < max_load_attempts:
+                        logging.info(
+                            "[recover_worker] retrying unload before next load attempt"
+                        )
+                        try:
+                            async with self.session.post(
+                                url_unload, headers=auth_headers, json={"model": model},
+                                timeout=ClientTimeout(total=10),
+                            ) as r:
+                                body_text = await r.text()
+                                if r.status >= 400:
+                                    logging.warning(
+                                        "[recover_worker] retry-unload returned %s: %s",
+                                        r.status, body_text,
+                                    )
+                                else:
+                                    logging.info(
+                                        "[recover_worker] retry-unload OK for %s", model
+                                    )
+                        except (ClientError, asyncio.TimeoutError) as e:
+                            logging.warning(
+                                "[recover_worker] retry-unload error (ignored): %s", e
+                            )
+                        # Brief pause to let the router settle before the next load.
+                        await asyncio.sleep(2)
+                    continue
 
             logging.error("[recover_worker] all %d load attempts failed for %s", max_load_attempts, model)
             return False
@@ -1132,9 +1162,24 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                         await downstream.write(chunk)
             except ConnectionResetError:
                 logging.info("[req=%s] client disconnected", req_id)
+                # Close upstream to give the router a clean TCP FIN.
+                # Without this, httplib in the router destroys the response object
+                # mid-stream and cancels the generation task, crashing the worker child.
+                # (See llama.cpp commit 635b70d and PR #23226 for the same pattern.)
+                try:
+                    upstream_resp.close()
+                except Exception:
+                    pass
             finally:
                 with contextlib.suppress(ConnectionResetError, RuntimeError):
                     await downstream.write_eof()
+                # Always close the upstream response to free the router's connection.
+                # Prevents zombie connections and worker child crashes on disconnect.
+                # close() is idempotent — safe if already closed in the except block.
+                try:
+                    upstream_resp.close()
+                except Exception:
+                    pass
                 duration_ms = int((time.monotonic() - started) * 1000)
                 logging.info(
                     "[req=%s] %s %s %s -> %s in %dms",

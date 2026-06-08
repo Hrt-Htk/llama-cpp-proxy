@@ -426,9 +426,24 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 await downstream.write(chunk)
         except ConnectionResetError:
             logging.info("[req=%s] client disconnected", req_id)
+            # Close upstream to give the router a clean TCP FIN.
+            # Without this, httplib in the router destroys the response object
+            # mid-stream and cancels the generation task, crashing the worker child.
+            # (See llama.cpp commit 635b70d and PR #23226 for the same pattern.)
+            try:
+                upstream_resp.close()
+            except Exception:
+                pass
         finally:
             with contextlib.suppress(ConnectionResetError, RuntimeError):
                 await downstream.write_eof()
+            # Always close the upstream response to free the router's connection.
+            # Prevents zombie connections and worker child crashes on disconnect.
+            # close() is idempotent — safe if already closed in the except block.
+            try:
+                upstream_resp.close()
+            except Exception:
+                pass
             duration_ms = int((time.monotonic() - started) * 1000)
             logging.info(
                 "[req=%s] %s %s %s -> %s in %dms",
