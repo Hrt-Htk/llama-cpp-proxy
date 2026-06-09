@@ -91,6 +91,10 @@ BOOT_TIMEOUT = 60
 LOAD_TIMEOUT = 300
 RETRY_AFTER_SECONDS = 30
 MIN_RESIDENCY = 8.0  # minimum seconds a loaded model is kept before an eviction is allowed
+# Post-cancel guard: how long to wait for a worker to answer a probe before
+# treating it as wedged. Covers a worker still finishing an orphaned prefill;
+# if it can't answer in this window we cycle it (the orphan was abandoned anyway).
+GUARD_PROBE_TIMEOUT = 30.0
 # Lowercased substrings that identify a dead-worker 500 from the router.
 # The router returns these when its HTTP client can't reach the worker child.
 DEAD_WORKER_MARKERS: tuple[str, ...] = (
@@ -138,6 +142,13 @@ class DeadWorkerError(Exception):
         self.status = status
         self.body = body
         super().__init__(f"dead-worker {status}: {body[:200]!r}")
+
+
+class ClientGone(Exception):
+    """Raised when the *downstream* client hangs up before we finish sending the
+    response (e.g. a connection reset during downstream.prepare()). Benign — it is
+    not a proxy fault, so it is logged calmly and returned as 499, unlike an
+    *upstream* reset from the router which is a real bad gateway (502)."""
 
 
 def _is_dead_worker_response(status: int, body: bytes) -> bool:
@@ -218,6 +229,12 @@ class ModelManager:
         self._idle_forward: asyncio.Event = asyncio.Event()
         self._idle_forward.set()  # set == 0 in-flight (idle)
         self._loaded_at: float = 0.0  # monotonic time the current model finished loading
+        # Set when a request is aborted mid-generation (client cancel/disconnect).
+        # llama-server has an unfixed cancel→next-request desync that wedges/crashes
+        # the worker (ggml-org/llama.cpp#20921), so the NEXT model request probes the
+        # worker first instead of detonating on it. Guarded by _guard_lock.
+        self._worker_suspect: bool = False
+        self._guard_lock = asyncio.Lock()
 
     @property
     def server_running(self) -> bool:
@@ -508,6 +525,7 @@ class ModelManager:
                 # Poll until status leaves "loading" (either loaded or unloaded)
                 poll_deadline = time.monotonic() + per_load_timeout
                 prev_status = ""
+                seen_loading = False  # have we observed this attempt actually start?
                 while time.monotonic() < poll_deadline:
                     try:
                         status = await self._status(model)
@@ -517,6 +535,8 @@ class ModelManager:
                     if status != prev_status:
                         logging.info("[recover_worker] %s status: %s", model, status)
                         prev_status = status
+                    if status == "loading":
+                        seen_loading = True
                     if status == "loaded":
                         # Give the router 1.5s to process any pending exit signal
                         # before declaring victory.
@@ -539,6 +559,20 @@ class ModelManager:
                     if status == "failed":
                         logging.error("[recover_worker] model %s failed to load", model)
                         return False
+                    if status == "unloaded" and seen_loading:
+                        # The worker started loading but was then stopped before ever
+                        # reaching "loaded" — a queued exit signal consumed it (the
+                        # router force-kills it after its ~10s stop timeout) or it
+                        # crashed mid-load. For a slow-loading model the kill lands
+                        # before "loaded" is ever observed, so the loaded→flash case
+                        # above never fires. Retry the next load immediately instead
+                        # of spinning here for the full per_load_timeout.
+                        logging.warning(
+                            "[recover_worker] fresh worker for %s died during load "
+                            "(status: unloaded, attempt %d/%d) — retrying",
+                            model, load_attempt, max_load_attempts,
+                        )
+                        break  # queued exit consumed — try next load attempt
                     await asyncio.sleep(0.25)
                 else:
                     logging.error(
@@ -579,6 +613,68 @@ class ModelManager:
 
             logging.error("[recover_worker] all %d load attempts failed for %s", max_load_attempts, model)
             return False
+
+    def mark_worker_suspect(self) -> None:
+        """Flag the worker as possibly desynced after a mid-generation client
+        abort (cancel/disconnect). The next model request will probe before use.
+        See _worker_suspect for the upstream bug this guards against."""
+        self._worker_suspect = True
+
+    async def _probe_worker(self, model: str) -> bool:
+        """Send a minimal generation to detect a wedged/crashed worker after a
+        cancel. Returns True if the worker answers normally; False if it returns
+        a dead-worker error, errors out, or times out (a busy-finishing-an-orphan
+        or genuinely-wedged worker both warrant a recovery cycle)."""
+        url = f"{self.config.backend_base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        try:
+            async with self.session.post(
+                url, headers=headers, json=payload,
+                timeout=ClientTimeout(total=GUARD_PROBE_TIMEOUT),
+            ) as r:
+                body = await r.read()
+                if _is_dead_worker_response(r.status, body):
+                    return False
+                return r.status < 500
+        except (ClientError, asyncio.TimeoutError) as e:
+            logging.warning("[guard] probe error for %s: %s", model, e)
+            return False
+
+    async def guard_after_cancel(self, model: str) -> None:
+        """If a prior request was aborted mid-generation, probe the worker once
+        before the next request uses it. Recover proactively if the probe shows
+        it wedged/dead — so the next real request lands on a clean worker instead
+        of triggering the upstream cancel→next-request crash."""
+        if not self._worker_suspect:
+            return
+        async with self._guard_lock:
+            if not self._worker_suspect:
+                return  # a concurrent caller already handled this episode
+            # Only the currently-loaded worker can be the wedged one. If a different
+            # model (or nothing) is loaded, use_model will spawn a fresh worker
+            # anyway, so there is nothing to probe — just clear the flag.
+            if self._loaded != model:
+                self._worker_suspect = False
+                return
+            logging.info("[guard] worker suspect after cancel — probing %s", model)
+            healthy = await self._probe_worker(model)
+            if healthy:
+                logging.info("[guard] worker %s healthy after cancel", model)
+            else:
+                logging.warning(
+                    "[guard] worker %s wedged/dead after cancel — recovering", model
+                )
+                await self.recover_worker(model, time.monotonic())
+            self._worker_suspect = False
 
     async def _status(self, model: str) -> str:
         url = f"{self.config.backend_base_url}/v1/models"
@@ -1113,7 +1209,10 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                     status=upstream_resp.status, reason=upstream_resp.reason,
                     headers=response_headers,
                 )
-                await downstream.prepare(request)
+                try:
+                    await downstream.prepare(request)
+                except ConnectionResetError:
+                    raise ClientGone from None
                 try:
                     await downstream.write(error_body)
                 except ConnectionResetError:
@@ -1134,7 +1233,10 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
             downstream = web.StreamResponse(
                 status=upstream_resp.status, reason=upstream_resp.reason, headers=response_headers,
             )
-            await downstream.prepare(request)
+            try:
+                await downstream.prepare(request)
+            except ConnectionResetError:
+                raise ClientGone from None
             try:
                 if is_sse and chat_logger:
                     wrapped = SSEChunkLogger(upstream_resp, chat_logger)
@@ -1162,14 +1264,19 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                         await downstream.write(chunk)
             except ConnectionResetError:
                 logging.info("[req=%s] client disconnected", req_id)
-                # Close upstream to give the router a clean TCP FIN.
-                # Without this, httplib in the router destroys the response object
-                # mid-stream and cancels the generation task, crashing the worker child.
-                # (See llama.cpp commit 635b70d and PR #23226 for the same pattern.)
+                # Closing upstream is the correct way to signal cancellation, but it
+                # does NOT prevent the worker crash on its own: llama-server has an
+                # unfixed cancel→next-request desync (ggml-org/llama.cpp#20921) that
+                # wedges/crashes the worker — worst with reasoning + speculative on a
+                # large-context (cancel-during-prefill) request. We can't make the
+                # cancel safe here, so we flag the worker suspect and let the NEXT
+                # model request probe it first (see guard_after_cancel).
                 try:
                     upstream_resp.close()
                 except Exception:
                     pass
+                if needs_model:
+                    manager.mark_worker_suspect()
             finally:
                 with contextlib.suppress(ConnectionResetError, RuntimeError):
                     await downstream.write_eof()
@@ -1189,7 +1296,29 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
                 return downstream
         except DeadWorkerError:
             raise  # propagate to retry loop
+        except ClientGone:
+            # Downstream client (cloudflared / end client) hung up before we finished
+            # sending the response — raised when downstream.prepare() hit a closing
+            # transport. Same benign disconnect the write loops already handle, just
+            # earlier. Not a proxy fault, so log calmly and return 499.
+            logging.info("[req=%s] client disconnected before response sent", req_id)
+            # Close the upstream response to release the router's connection. The
+            # worker had already begun generating (it produced response headers), so
+            # this is a mid-generation abort too — flag it for the post-cancel guard.
+            try:
+                upstream_resp.close()
+            except Exception:
+                pass
+            if needs_model:
+                manager.mark_worker_suspect()
+            return web.Response(
+                status=499, reason="Client Closed Request",
+                headers={"X-Request-ID": req_id},
+            )
         except ClientError as exc:
+            # Genuine upstream failure (router connection reset/refused, etc.) — a
+            # real bad gateway. Note: an *upstream* ClientConnectionResetError lands
+            # here, while a *downstream* one was already converted to ClientGone above.
             logging.exception("[req=%s] proxy failure", req_id)
             return web.json_response(
                 {"error": "bad gateway", "detail": str(exc)},
@@ -1198,6 +1327,11 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
 
     try:
         if needs_model:
+            # Post-cancel guard: if a prior request was aborted mid-generation,
+            # probe (and recover if needed) the worker before this request hits it,
+            # avoiding the upstream cancel→next-request crash. No-op when not suspect.
+            # Runs outside use_model so its recover_worker() doesn't nest _load_lock.
+            await manager.guard_after_cancel(model)
             # Wrap the entire forward inside use_model so _end_forward() only
             # fires after the stream is fully drained — no eviction mid-stream.
             # Up to 2 attempts: on DeadWorkerError, recover then retry once.
