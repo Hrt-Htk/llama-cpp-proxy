@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp.web_log import AccessLogger
 
 from log_paths import (
     DATE_FMT,
@@ -1078,10 +1079,38 @@ def _strip_chat_prefix(path: str) -> str:
     return path
 
 
+# Reverse-proxy hops allowed to set forwarding headers. We listen on
+# 0.0.0.0:8001, so a direct LAN client could spoof X-Forwarded-For /
+# CF-Connecting-IP; only trust those headers when the TCP peer is Caddy (LAN
+# front) or cloudflared (loopback). Override the Caddy IP via $TRUSTED_PROXY.
+TRUSTED_PROXIES = {"127.0.0.1", "::1", os.environ.get("TRUSTED_PROXY", "192.168.178.43")}
+
+
 def client_ip(request: web.Request) -> str:
-    """Real client IP — CF-Connecting-IP when behind the Cloudflare tunnel,
-    otherwise the peer address (which is just cloudflared's loopback)."""
-    return request.headers.get("CF-Connecting-IP") or request.remote or "-"
+    """Real client IP. When the request arrives from a trusted reverse proxy
+    (Caddy on the LAN, or cloudflared on loopback) we read the forwarded client
+    out of CF-Connecting-IP / X-Forwarded-For; otherwise we report the raw TCP
+    peer. Untrusted peers can't spoof their way to a fake IP."""
+    peer = request.remote or "-"
+    if peer in TRUSTED_PROXIES:
+        forwarded = (
+            request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        )
+        if forwarded:
+            return forwarded
+    return peer
+
+
+class ForwardedAccessLogger(AccessLogger):
+    """aiohttp access logger that resolves the ``%a`` atom through client_ip(),
+    so the access line shows the real client instead of the reverse-proxy hop."""
+
+    @staticmethod
+    def _format_a(request, response, time):
+        if request is None:
+            return "-"
+        return client_ip(request)
 
 
 # Paths reachable without an API key. /health is the cloudflared/uptime probe.
@@ -1592,6 +1621,7 @@ def main() -> int:
             build_app(config),
             host=config.proxy_host, port=config.proxy_port,
             reuse_address=True,
+            access_log_class=ForwardedAccessLogger,
             access_log_format='%a req=%{X-Request-ID}o "%r" %s %b %Dus',
         )
     except OSError as e:
