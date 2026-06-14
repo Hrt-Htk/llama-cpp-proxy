@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  workflow-checks:
+    name: Workflow Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine commit range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "range=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "range=${{ github.event.before }}..${{ github.event.after }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check conventional commit format
+        run: |
+          RANGE="${{ steps.range.outputs.range }}"
+          BAD=$(git log --no-merges --format="%s" "$RANGE" | grep -cvE '^(feat|fix|chore|docs|refactor|test|perf|build|ci|style)(\(.+\))?: .+' || true)
+          if [ "$BAD" -gt 0 ]; then
+            echo "::error::$BAD commit(s) do not follow Conventional Commits format."
+            git log --no-merges --format="%s" "$RANGE" | grep -vE '^(feat|fix|chore|docs|refactor|test|perf|build|ci|style)(\(.+\))?: .+'
+            exit 1
+          fi
+
+      - name: Check branch naming (push only)
+        if: github.event_name == 'push'
+        run: |
+          BRANCH=$(echo "${{ github.ref }}" | sed 's|refs/heads/||')
+          if [ "$BRANCH" = "main" ]; then
+            echo "Skipping branch check for main"
+            exit 0
+          fi
+          if ! echo "$BRANCH" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf)/issue[0-9]+-.*'; then
+            echo "::error::Branch '$BRANCH' does not match type/issueN-description pattern."
+            exit 1
+          fi
+
+      - name: Check issue reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          RANGE="${{ steps.range.outputs.range }}"
+          COMMITS=$(git log --no-merges --format="%s %b" "$RANGE")
+          HAS_ISSUE=0
+          if echo "$COMMITS" | grep -qE '#[0-9]+'; then
+            HAS_ISSUE=1
+          fi
+          if echo "$PR_BODY" | grep -qE '#[0-9]+'; then
+            HAS_ISSUE=1
+          fi
+          if [ "$HAS_ISSUE" -eq 0 ]; then
+            echo "::error::No issue reference (#[0-9]+) found in commits or PR body."
+            exit 1
+          fi
+
+      - name: Size limit warning
+        run: |
+          RANGE="${{ steps.range.outputs.range }}"
+          STATS=$(git diff --shortstat "$RANGE")
+          FILES=$(echo "$STATS" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || true)
+          INSERTIONS=$(echo "$STATS" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || true)
+          DELETIONS=$(echo "$STATS" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || true)
+          FILES=${FILES:-0}
+          INSERTIONS=${INSERTIONS:-0}
+          DELETIONS=${DELETIONS:-0}
+          TOTAL_LINES=$((INSERTIONS + DELETIONS))
+          if [ "$FILES" -gt 10 ]; then
+            echo "::warning::PR touches $FILES files (soft limit: 10). Consider splitting."
+          fi
+          if [ "$TOTAL_LINES" -gt 300 ]; then
+            echo "::warning::PR changes $TOTAL_LINES lines (soft limit: 300). Consider splitting."
+          fi
