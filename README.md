@@ -20,14 +20,17 @@ concurrently.
 | File | Role |
 |---|---|
 | `proxy.py` | Chat proxy + router supervisor. Generates `models-preset.ini` at startup. Also reverse-proxies `/embedding/*` to the embed stack. |
-| `embed_proxy.py` | Embedding proxy + router supervisor. Generates `embed-preset.ini`. |
+| `embed_proxy.py` | Embedding/re-ranking proxy + router supervisor. Generates `embed-preset.ini`. |
 | `watchdog.ps1` | Restart-on-crash supervisor for `proxy.py`. |
 | `watchdog-embed.ps1` | Restart-on-crash supervisor for `embed_proxy.py`. |
+| `restart-watchdog.ps1` | Graceful midnight restart for chat watchdog (WM_CLOSE → cascade shutdown → relaunch). |
+| `restart-watchdog-embed.ps1` | Same for embed watchdog, staggered 1 min after chat. |
+| `create-scheduler-tasks.ps1` | Creates daily Task Scheduler entries (run once as Administrator). |
 | `log_paths.py` | Shared log path resolution and formatting utilities. |
 | `log_paths.ps1` | PowerShell helper for inspecting log paths. |
+| `chat_template.jinja` | Custom Jinja chat template passed to llama-server. |
 | `models-preset.ini` | Auto-generated (don't edit). Every `MODELS × CTX_CHOICES` combo as its own preset. |
 | `embed-preset.ini` | Auto-generated (don't edit). Single preset for `Qwen3-Embedding-4B`. |
-| `ping-both.py` | Fires a chat + embedding request concurrently end-to-end. |
 | `models/` | GGUF weights. `models/_aux/` holds mmproj projectors. |
 | `llama.cpp_latest/llama-server.exe` | The router binary. |
 
@@ -42,7 +45,7 @@ concurrently.
    ```powershell
    pip install aiohttp
    ```
-3. **Download `llama-server.exe`** — get the latest Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) and place it in `llama.cpp_latest/`.
+3. **Download `llama-server.exe`** — get a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) (b9209+ for MTP support) and place it in `llama.cpp_latest/`.
 4. **Download GGUF models** — place your model files in the `models/` directory.
 5. **Set your API key** — export the environment variable (overrides the hardcoded fallback in the proxy code):
    ```powershell
@@ -58,11 +61,13 @@ H:\llama.cpp\watchdog.ps1                  # chat stack on :8001
 H:\llama.cpp\watchdog-embed.ps1            # embed stack on :8003
 ```
 
-**Public tunnel** — `cloudflared` is set up separately (outside this repo). Install `cloudflared.exe`, configure your tunnel in `~/.cloudflared/config.yml`, then run it however you prefer.
+**Daily restart** — create Task Scheduler entries so watchdogs restart cleanly at midnight:
 
 ```powershell
-<your-cloudflared-path>\run-tunnel.ps1     # public tunnel
+H:\llama.cpp\create-scheduler-tasks.ps1    # run once as Administrator
 ```
+
+**Public tunnel** — `cloudflared` is set up separately (outside this repo). Install `cloudflared.exe`, configure your tunnel in `~/.cloudflared/config.yml`, then run it however you prefer.
 
 Headless chat variant (skip the interactive picker — sets the *fallback* model
 when a client request omits the `model` field; all combos are still routable):
@@ -75,16 +80,10 @@ H:\llama.cpp\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768
 
 - **Chat:** `https://ai.example.com/chat/v1/chat/completions` — model field selects preset (e.g. `qwen3.6-35b-q3-32k`).
 - **Embeddings:** `https://ai.example.com/embedding/v1/embeddings` — model `qwen3-embedding-4b-8k`.
+- **Re-ranking:** `https://ai.example.com/embedding/v1/rerank` — same embed router.
 - Both require `Authorization: Bearer <key>`. Set via `$env:LLAMA_API_KEY` (overrides the hardcoded fallback in the proxy code).
 
 `/health` on either port reports proxy + router state and which model is currently loaded.
-
-## Verify
-
-```powershell
-H:\llama.cpp\.venv\Scripts\python.exe H:\llama.cpp\ping-both.py            # through the tunnel
-H:\llama.cpp\.venv\Scripts\python.exe H:\llama.cpp\ping-both.py --local    # localhost only
-```
 
 ## How the load/unload flow works
 
@@ -97,22 +96,20 @@ Cold-load latency: ~15–20s for the 35B chat model on a 3090 Ti; ~2–3s for th
 
 ## Adding a model
 
-Chat side — append a `ModelChoice(...)` to `MODELS` in `proxy.py`. Every entry is automatically crossed with `CTX_CHOICES` to produce one preset per (model × ctx) pair. No INI editing.
+Chat side — append a `ModelChoice(...)` to `MODELS` in `proxy.py`. Every entry is automatically crossed with `CTX_CHOICES` (32k, 64k, 96k, 128k) to produce one preset per (model × ctx) pair. No INI editing.
 
-**MTP (speculative decoding)** — set `spec_mtp=True` on a `ModelChoice` to enable built-in MTP speculative decoding. This emits `spec-type=draft-mtp`, `spec-draft-n-max=3`, `spec-draft-p-min=0.0` in the preset. Requires the b9209+ router binary (PR ggml-org/llama.cpp#22673). The 27B model has an MTP variant (`qwen3.6-27b-q4-mtp`) that uses `models/Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf`.
+Each preset uses KV cache quantization (`cache-type-k = q4_0`, `cache-type-v = q4_0`), flash attention, and a custom Jinja chat template (`chat_template.jinja` with `preserve_thinking` kwarg).
+
+**MTP (speculative decoding)** — set `spec_mtp=True` on a `ModelChoice` to enable built-in MTP speculative decoding. This emits `spec-type=draft-mtp`, `spec-draft-n-max=2`, `spec-draft-p-min=0.0` in the preset. Requires the b9209+ router binary (PR ggml-org/llama.cpp#22673). The 27B model has an MTP variant (`qwen3.6-27b-q4-mtp`) that uses `models/Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf`.
 
 Embed side — `embed_proxy.py` is hardcoded to a single model (`MODEL_FILE`, `MODEL_ID`, `CTX_SIZE` constants at the top). Change those if you swap the embedder.
 
 ## Logs
 
-- `logs/<date>.log` — chat proxy events
-- `logs/embed-proxy-<date>.log` — embed proxy events
-- `logs/llama-server-<date>.log` — chat router output
-- `logs/embed-server-<date>.log` — embed router output
-- `logs/chat-<date>.log` and `logs/chat-<date>.raw.jsonl` — per-request chat traces (proxy.py only)
-- `cloudflared/logs/<date>.log` — tunnel logs
-
-## Background docs
-
-`ROUTER_MODE_SETUP.md` is the migration write-up from the pre-router proxy to the
-current router-mode design. Useful context, not required reading.
+- `logs/<week>/proxy-<date>.log` — chat proxy events
+- `logs/<week>/embed-proxy-<date>.log` — embed proxy events
+- `logs/<week>/llama-server-<date>.log` — chat router output
+- `logs/<week>/embed-server-<date>.log` — embed router output
+- `logs/<week>/chat-<date>.log` and `chat-<date>.raw.jsonl` — per-request chat traces (proxy.py only)
+- `logs/<week>/watchdog-restart-<date>.log` — daily restart logs
+- All logs are bucketed by ISO week folder.
