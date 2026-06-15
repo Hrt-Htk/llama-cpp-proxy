@@ -14,7 +14,9 @@ Bare `ai.example.com/v1/...` at the root also still hits the chat router
 
 ## Code
 
-- `proxy.py` — chat proxy. Owns the chat router process, generates `models-preset.ini` at startup from `MODELS × CTX_CHOICES`, load/unload via `/models/load` & `/models/unload`, idle-unloads after 10 min. Has chat logging (`logs/chat-<date>.log`) and SSE chunk capture. Also reverse-proxies `/embedding/*` to `embed_proxy.py` on :8003 (strips the `/embedding` prefix; embed lifecycle stays owned by `embed_proxy.py`).
+- `proxy.py` — slim entry point (app lifecycle, route registration). Imports handlers from `proxy_request_handlers` and config from `proxy_config`.
+- `proxy_config.py` — model metadata, preset generation, CLI config.
+- `proxy_request_handlers.py` — HTTP request handlers, streaming, retry/recovery.
 - `embed_proxy.py` — slimmed-down twin of `proxy.py` for the embedder. Single model, no chat logging, no SSE parsing. Same load/unload pattern. Supports embeddings and re-ranking (`/v1/embeddings`, `/v1/rerank`).
 - `watchdog.ps1` / `watchdog-embed.ps1` — thin restart-on-crash supervisors. They forward all extra args to the underlying Python script.
 - `restart-watchdog.ps1` / `restart-watchdog-embed.ps1` — graceful midnight restarts (WM_CLOSE → cascade shutdown → relaunch). Run via Task Scheduler.

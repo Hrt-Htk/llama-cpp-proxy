@@ -127,12 +127,7 @@ class RouterManager:
             self._loaded = model
             return
         logging.info("Loading model: %s", model)
-        url = f"{self.config.backend_base_url}/models/load"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
-        async with self.session.post(url, headers=headers, json={"model": model}) as r:
+        async with self._post_json("/models/load", {"model": model}) as r:
             if r.status >= 400:
                 body = await r.text()
                 if "already running" in body:
@@ -140,29 +135,17 @@ class RouterManager:
                     return
                 raise RuntimeError(f"load returned {r.status}: {body}")
         deadline = time.monotonic() + self.LOAD_TIMEOUT
-        while time.monotonic() < deadline:
-            status = await self._status(model)
-            if status == "loaded":
-                self._loaded = model
-                logging.info("Model loaded: %s", model)
-                return
-            if status == "failed":
-                raise RuntimeError(f"model {model} failed to load")
-            await asyncio.sleep(0.5)
-        raise TimeoutError(f"model {model} did not load in {self.LOAD_TIMEOUT}s")
+        if await self._poll_until_loaded(model, deadline):
+            self._loaded = model
+            logging.info("Model loaded: %s", model)
 
     async def unload(self, reason: str) -> None:
         if self._loaded is None:
             return
         model = self._loaded
         logging.info("Unloading %s (%s)", model, reason)
-        url = f"{self.config.backend_base_url}/models/unload"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
         try:
-            async with self.session.post(url, headers=headers, json={"model": model}) as r:
+            async with self._post_json("/models/unload", {"model": model}) as r:
                 if r.status >= 400:
                     logging.warning("unload returned %s", r.status)
         except ClientError as e:
@@ -170,9 +153,7 @@ class RouterManager:
         self._loaded = None
 
     async def _status(self, model: str) -> str:
-        url = f"{self.config.backend_base_url}/v1/models"
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
-        async with self.session.get(url, headers=headers) as r:
+        async with self._get_json("/v1/models") as r:
             data = await r.json()
         for entry in data.get("data", []):
             if entry.get("id") == model:
@@ -188,6 +169,44 @@ class RouterManager:
         idle = time.monotonic() - self._last_activity
         if idle >= self.config.idle_timeout:
             await self.unload(f"idle for {int(idle)}s")
+
+    # ── HTTP helpers ──────────────────────────────────────────────────────
+
+    def _auth_headers(self, content_type: str = "application/json") -> dict:
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": content_type,
+        }
+
+    def _post_json(self, path: str, json_data: dict,
+                   timeout: float | None = None):
+        url = f"{self.config.backend_base_url}{path}"
+        kwargs: dict = {"headers": self._auth_headers(), "json": json_data}
+        if timeout is not None:
+            kwargs["timeout"] = ClientTimeout(total=timeout)
+        return self.session.post(url, **kwargs)
+
+    def _get_json(self, path: str, timeout: float | None = None):
+        url = f"{self.config.backend_base_url}{path}"
+        kwargs: dict = {"headers": {"Authorization": f"Bearer {self.config.api_key}"}}
+        if timeout is not None:
+            kwargs["timeout"] = ClientTimeout(total=timeout)
+        return self.session.get(url, **kwargs)
+
+    async def _poll_until_loaded(self, model: str, deadline: float) -> bool:
+        """Poll *model* status until loaded, failed, or *deadline* expires.
+
+        Returns True on success (model reached "loaded"). Raises RuntimeError
+        on "failed" and TimeoutError on deadline expiry.
+        """
+        while time.monotonic() < deadline:
+            status = await self._status(model)
+            if status == "loaded":
+                return True
+            if status == "failed":
+                raise RuntimeError(f"model {model} failed to load")
+            await asyncio.sleep(0.5)
+        raise TimeoutError(f"model {model} did not load in {self.LOAD_TIMEOUT}s")
 
 
 # ── Chat subclass ───────────────────────────────────────────────────────────
@@ -246,12 +265,7 @@ class ChatRouterManager(RouterManager):
             self._loaded_at = time.monotonic()
             return
         logging.info("Loading model: %s", model)
-        url = f"{self.config.backend_base_url}/models/load"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
-        async with self.session.post(url, headers=headers, json={"model": model}) as r:
+        async with self._post_json("/models/load", {"model": model}) as r:
             if r.status >= 400:
                 body = await r.text()
                 if "already running" in body:
@@ -260,17 +274,10 @@ class ChatRouterManager(RouterManager):
                     return
                 raise RuntimeError(f"load returned {r.status}: {body}")
         deadline = time.monotonic() + self.LOAD_TIMEOUT
-        while time.monotonic() < deadline:
-            status = await self._status(model)
-            if status == "loaded":
-                self._loaded = model
-                self._loaded_at = time.monotonic()
-                logging.info("Model loaded: %s", model)
-                return
-            if status == "failed":
-                raise RuntimeError(f"model {model} failed to load")
-            await asyncio.sleep(0.5)
-        raise TimeoutError(f"model {model} did not load in {self.LOAD_TIMEOUT}s")
+        if await self._poll_until_loaded(model, deadline):
+            self._loaded = model
+            self._loaded_at = time.monotonic()
+            logging.info("Model loaded: %s", model)
 
     @contextlib.asynccontextmanager
     async def use_model(self, model: str):
@@ -307,6 +314,167 @@ class ChatRouterManager(RouterManager):
         finally:
             self._end_forward()
 
+        # ── recover_worker helpers ────────────────────────────────────────────
+
+    async def _recover_check_peer(
+        self, model: str, dead_detected_at: float,
+    ) -> bool:
+        """Return True if a peer coroutine already recovered *model*."""
+        if self._loaded == model and self._loaded_at > dead_detected_at:
+            logging.info(
+                "[recover_worker] %s already recovered by peer (loaded_at=%.3f > detected=%.3f)",
+                model, self._loaded_at, dead_detected_at,
+            )
+            return True
+        return False
+
+    async def _recover_unload(
+        self, model: str, url_unload: str, auth_headers: dict,
+    ) -> None:
+        """Best-effort unload POST — force the router to tear down the dead worker entry."""
+        try:
+            async with self.session.post(
+                url_unload, headers=auth_headers, json={"model": model},
+                timeout=ClientTimeout(total=10),
+            ) as r:
+                body_text = await r.text()
+                if r.status >= 400:
+                    logging.warning("[recover_worker] unload returned %s: %s", r.status, body_text)
+                else:
+                    logging.info("[recover_worker] unload OK for %s", model)
+        except (ClientError, asyncio.TimeoutError) as e:
+            logging.warning("[recover_worker] unload error (ignored): %s", e)
+
+    async def _recover_wait_unloaded(self, model: str) -> None:
+        """Poll until the router confirms *model* is no longer loaded (15 s deadline)."""
+        unload_deadline = time.monotonic() + 15
+        while time.monotonic() < unload_deadline:
+            try:
+                status = await self._status(model)
+                if status != "loaded":
+                    logging.info("[recover_worker] router confirms %s is %s", model, status)
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        else:
+            logging.warning(
+                "[recover_worker] router still shows loaded after 15s — proceeding anyway"
+            )
+
+    async def _recover_load_once(
+        self, model: str, load_attempt: int, max_load_attempts: int,
+        load_url: str, auth_headers: dict,
+    ) -> bool | str:
+        """Execute one load attempt with rapid-poll and stability check.
+
+        Returns True on success (worker stable), False on terminal failure
+        (POST error or status "failed"), "retry_now" on queued-exit flash
+        or mid-load death (retry immediately, no unload/sleep),
+        "retry_after_unload" on poll timeout (caller should unload + sleep).
+        """
+        logging.info(
+            "[recover_worker] load attempt %d/%d for %s",
+            load_attempt, max_load_attempts, model,
+        )
+        try:
+            async with self.session.post(
+                load_url, headers=auth_headers, json={"model": model},
+                timeout=ClientTimeout(total=10),
+            ) as r:
+                body_text = await r.text()
+                if r.status >= 400 and "already running" not in body_text:
+                    logging.warning("[recover_worker] load returned %s: %s", r.status, body_text)
+        except (ClientError, asyncio.TimeoutError) as e:
+            logging.error("[recover_worker] load POST failed: %s", e)
+            return False
+
+        # Poll until status leaves "loading" (either loaded or unloaded)
+        poll_deadline = time.monotonic() + 120  # per_load_timeout
+        prev_status = ""
+        seen_loading = False
+        while time.monotonic() < poll_deadline:
+            try:
+                status = await self._status(model)
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
+            if status != prev_status:
+                logging.info("[recover_worker] %s status: %s", model, status)
+                prev_status = status
+            if status == "loading":
+                seen_loading = True
+            if status == "loaded":
+                # Give the router 1.5s to process any pending exit signal
+                # before declaring victory.
+                await asyncio.sleep(1.5)
+                status2 = await self._status(model)
+                if status2 == "loaded":
+                    self._loaded = model
+                    self._loaded_at = time.monotonic()
+                    logging.info(
+                        "[recover_worker] worker stable for %s (attempt %d)",
+                        model, load_attempt,
+                    )
+                    return True
+                logging.warning(
+                    "[recover_worker] fresh worker for %s exited immediately "
+                    "(status after 1.5s: %s, attempt %d/%d)",
+                    model, status2, load_attempt, max_load_attempts,
+                )
+                return "retry_now"  # queued exit consumed — try next load attempt
+            if status == "failed":
+                logging.error("[recover_worker] model %s failed to load", model)
+                return False
+            if status == "unloaded" and seen_loading:
+                # The worker started loading but was then stopped before ever
+                # reaching "loaded" — a queued exit signal consumed it (the
+                # router force-kills it after its ~10s stop timeout) or it
+                # crashed mid-load. For a slow-loading model the kill lands
+                # before "loaded" is ever observed, so the loaded→flash case
+                # above never fires. Retry the next load immediately instead
+                # of spinning here for the full per_load_timeout.
+                logging.warning(
+                    "[recover_worker] fresh worker for %s died during load "
+                    "(status: unloaded, attempt %d/%d) — retrying",
+                    model, load_attempt, max_load_attempts,
+                )
+                return "retry_now"  # queued exit consumed — try next load attempt
+            await asyncio.sleep(0.25)
+
+        logging.error(
+            "[recover_worker] timed out waiting for %s to load (attempt %d/%d)",
+            model, load_attempt, max_load_attempts,
+        )
+        return "retry_after_unload"  # timeout — caller may retry unload before next attempt
+
+    async def _recover_retry_unload(
+        self, model: str, url_unload: str, auth_headers: dict,
+    ) -> None:
+        """Retry unload after a timed-out load attempt, then pause 2 s."""
+        logging.info("[recover_worker] retrying unload before next load attempt")
+        try:
+            async with self.session.post(
+                url_unload, headers=auth_headers, json={"model": model},
+                timeout=ClientTimeout(total=10),
+            ) as r:
+                body_text = await r.text()
+                if r.status >= 400:
+                    logging.warning(
+                        "[recover_worker] retry-unload returned %s: %s",
+                        r.status, body_text,
+                    )
+                else:
+                    logging.info(
+                        "[recover_worker] retry-unload OK for %s", model
+                    )
+        except (ClientError, asyncio.TimeoutError) as e:
+            logging.warning(
+                "[recover_worker] retry-unload error (ignored): %s", e
+            )
+        # Brief pause to let the router settle before the next load.
+        await asyncio.sleep(2)
+
     async def recover_worker(self, model: str, dead_detected_at: float) -> bool:
         """Force-cycle the router worker for *model* after a dead-worker 500.
 
@@ -323,13 +491,7 @@ class ChatRouterManager(RouterManager):
         error so the caller can return 503.
         """
         async with self._load_lock:
-            # Re-check: if _loaded_at was updated AFTER the dead-worker was
-            # detected, a peer coroutine already completed recovery.
-            if self._loaded == model and self._loaded_at > dead_detected_at:
-                logging.info(
-                    "[recover_worker] %s already recovered by peer (loaded_at=%.3f > detected=%.3f)",
-                    model, self._loaded_at, dead_detected_at,
-                )
+            if await self._recover_check_peer(model, dead_detected_at):
                 return True
 
             logging.warning(
@@ -345,35 +507,11 @@ class ChatRouterManager(RouterManager):
                 "Authorization": f"Bearer {self.config.api_key}",
                 "Content-Type": "application/json",
             }
-            try:
-                async with self.session.post(
-                    url_unload, headers=auth_headers, json={"model": model},
-                    timeout=ClientTimeout(total=10),
-                ) as r:
-                    body_text = await r.text()
-                    if r.status >= 400:
-                        logging.warning("[recover_worker] unload returned %s: %s", r.status, body_text)
-                    else:
-                        logging.info("[recover_worker] unload OK for %s", model)
-            except (ClientError, asyncio.TimeoutError) as e:
-                logging.warning("[recover_worker] unload error (ignored): %s", e)
+            await self._recover_unload(model, url_unload, auth_headers)
 
             # Wait for the router to reflect the unloaded state so that
             # _load_locked doesn't see "loaded" and short-circuit.
-            unload_deadline = time.monotonic() + 15
-            while time.monotonic() < unload_deadline:
-                try:
-                    status = await self._status(model)
-                    if status != "loaded":
-                        logging.info("[recover_worker] router confirms %s is %s", model, status)
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
-            else:
-                logging.warning(
-                    "[recover_worker] router still shows loaded after 15s — proceeding anyway"
-                )
+            await self._recover_wait_unloaded(model)
 
             # Reload — spawn fresh worker(s), draining any buffered exit
             # signals the router queued during unload. Each exit signal
@@ -388,113 +526,23 @@ class ChatRouterManager(RouterManager):
             # the loaded→unloaded flash and retries the load immediately.
             load_url = f"{self.config.backend_base_url}/models/load"
             max_load_attempts = 4
-            per_load_timeout = 120  # seconds to wait for status != "loading"
 
             for load_attempt in range(1, max_load_attempts + 1):
-                logging.info(
-                    "[recover_worker] load attempt %d/%d for %s",
-                    load_attempt, max_load_attempts, model,
+                result = await self._recover_load_once(
+                    model, load_attempt, max_load_attempts,
+                    load_url, auth_headers,
                 )
-                try:
-                    async with self.session.post(
-                        load_url, headers=auth_headers, json={"model": model},
-                        timeout=ClientTimeout(total=10),
-                    ) as r:
-                        body_text = await r.text()
-                        if r.status >= 400 and "already running" not in body_text:
-                            logging.warning("[recover_worker] load returned %s: %s", r.status, body_text)
-                except (ClientError, asyncio.TimeoutError) as e:
-                    logging.error("[recover_worker] load POST failed: %s", e)
+                if result is True:
+                    return True
+                if result is False:
                     return False
-
-                # Poll until status leaves "loading" (either loaded or unloaded)
-                poll_deadline = time.monotonic() + per_load_timeout
-                prev_status = ""
-                seen_loading = False  # have we observed this attempt actually start?
-                while time.monotonic() < poll_deadline:
-                    try:
-                        status = await self._status(model)
-                    except Exception:
-                        await asyncio.sleep(0.5)
-                        continue
-                    if status != prev_status:
-                        logging.info("[recover_worker] %s status: %s", model, status)
-                        prev_status = status
-                    if status == "loading":
-                        seen_loading = True
-                    if status == "loaded":
-                        # Give the router 1.5s to process any pending exit signal
-                        # before declaring victory.
-                        await asyncio.sleep(1.5)
-                        status2 = await self._status(model)
-                        if status2 == "loaded":
-                            self._loaded = model
-                            self._loaded_at = time.monotonic()
-                            logging.info(
-                                "[recover_worker] worker stable for %s (attempt %d)",
-                                model, load_attempt,
-                            )
-                            return True
-                        logging.warning(
-                            "[recover_worker] fresh worker for %s exited immediately "
-                            "(status after 1.5s: %s, attempt %d/%d)",
-                            model, status2, load_attempt, max_load_attempts,
-                        )
-                        break  # queued exit consumed — try next load attempt
-                    if status == "failed":
-                        logging.error("[recover_worker] model %s failed to load", model)
-                        return False
-                    if status == "unloaded" and seen_loading:
-                        # The worker started loading but was then stopped before ever
-                        # reaching "loaded" — a queued exit signal consumed it (the
-                        # router force-kills it after its ~10s stop timeout) or it
-                        # crashed mid-load. For a slow-loading model the kill lands
-                        # before "loaded" is ever observed, so the loaded→flash case
-                        # above never fires. Retry the next load immediately instead
-                        # of spinning here for the full per_load_timeout.
-                        logging.warning(
-                            "[recover_worker] fresh worker for %s died during load "
-                            "(status: unloaded, attempt %d/%d) — retrying",
-                            model, load_attempt, max_load_attempts,
-                        )
-                        break  # queued exit consumed — try next load attempt
-                    await asyncio.sleep(0.25)
-                else:
-                    logging.error(
-                        "[recover_worker] timed out waiting for %s to load (attempt %d/%d)",
-                        model, load_attempt, max_load_attempts,
+                # retryable: "retry_now" → next attempt immediately;
+                #            "retry_after_unload" → unload + 2s pause first
+                #            (only if attempts remain)
+                if result == "retry_after_unload" and load_attempt < max_load_attempts:
+                    await self._recover_retry_unload(
+                        model, url_unload, auth_headers,
                     )
-                    # Don't return False here — let the for-loop try the next attempt.
-                    # The router may need a fresh /models/load POST to clear a stuck
-                    # "loading" state from a previous crash.
-                    # Retry the unload to give the router a chance to tear down
-                    # any zombie worker entry from the timed-out attempt.
-                    if load_attempt < max_load_attempts:
-                        logging.info(
-                            "[recover_worker] retrying unload before next load attempt"
-                        )
-                        try:
-                            async with self.session.post(
-                                url_unload, headers=auth_headers, json={"model": model},
-                                timeout=ClientTimeout(total=10),
-                            ) as r:
-                                body_text = await r.text()
-                                if r.status >= 400:
-                                    logging.warning(
-                                        "[recover_worker] retry-unload returned %s: %s",
-                                        r.status, body_text,
-                                    )
-                                else:
-                                    logging.info(
-                                        "[recover_worker] retry-unload OK for %s", model
-                                    )
-                        except (ClientError, asyncio.TimeoutError) as e:
-                            logging.warning(
-                                "[recover_worker] retry-unload error (ignored): %s", e
-                            )
-                        # Brief pause to let the router settle before the next load.
-                        await asyncio.sleep(2)
-                    continue
 
             logging.error("[recover_worker] all %d load attempts failed for %s", max_load_attempts, model)
             return False
@@ -510,11 +558,6 @@ class ChatRouterManager(RouterManager):
         cancel. Returns True if the worker answers normally; False if it returns
         a dead-worker error, errors out, or times out (a busy-finishing-an-orphan
         or genuinely-wedged worker both warrant a recovery cycle)."""
-        url = f"{self.config.backend_base_url}/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
@@ -522,9 +565,9 @@ class ChatRouterManager(RouterManager):
             "stream": False,
         }
         try:
-            async with self.session.post(
-                url, headers=headers, json=payload,
-                timeout=ClientTimeout(total=GUARD_PROBE_TIMEOUT),
+            async with self._post_json(
+                "/v1/chat/completions", payload,
+                timeout=GUARD_PROBE_TIMEOUT,
             ) as r:
                 body = await r.read()
                 if _is_dead_worker_response(r.status, body):

@@ -179,7 +179,7 @@ class SSEChunkLogger:
         await self._flush_text()
         await self._flush_tool_calls()
 
-    # ---- rescue helpers ----
+    # ── rescue helpers ──
 
     @staticmethod
     def _split_safe_prefix(text: str, markers: tuple[str, ...]) -> tuple[str, str]:
@@ -244,7 +244,7 @@ class SSEChunkLogger:
         body = json.dumps(event, ensure_ascii=False)
         return f"data: {body}\r\n\r\n".encode()
 
-    # ---- main read loop ----
+    # ── main read loop ──
 
     async def readany(self) -> bytes:
         # Loop so we only ever return b"" at true EOF — the consumer treats an
@@ -255,38 +255,95 @@ class SSEChunkLogger:
             if out is not None:
                 return out
 
+    # ── read loop helpers ──
+
+    async def _handle_eof(self) -> bytes | None:
+        """Handle EOF: flush buffers and return any leftover."""
+        await self._flush_all()
+        if self._buffer:
+            leftover = self._buffer
+            self._buffer = b""
+            return leftover
+        return b""
+
+    @staticmethod
+    def _find_event_boundary(buffer: bytes):
+        """Find the earliest SSE event boundary in *buffer*.
+
+        Returns (idx, sep_len) or None if no boundary found.
+        """
+        crlf_idx = buffer.find(b"\r\n\r\n")
+        lf_idx = buffer.find(b"\n\n")
+        if crlf_idx == -1 and lf_idx == -1:
+            return None
+        if crlf_idx != -1 and (lf_idx == -1 or crlf_idx <= lf_idx):
+            return crlf_idx, 4
+        return lf_idx, 2
+
+    @staticmethod
+    def _extract_payload(event_text: str) -> str:
+        """Extract the payload from an SSE event text block (last data: line wins)."""
+        payload = ""
+        for line in event_text.splitlines():
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+        return payload
+
+    async def _log_delta(self, obj: dict) -> None:
+        """Process a parsed SSE event for logging side-effects.
+
+        Updates _current_kind, _current_text, _tool_calls, and
+        _last_chunk_id on the instance.
+        """
+        choices = obj.get("choices") or []
+        if not choices:
+            return
+        delta = choices[0].get("delta") or {}
+        reasoning = delta.get("reasoning_content")
+        content = delta.get("content")
+        tool_calls = delta.get("tool_calls")
+        if reasoning:
+            if self._current_kind != "thinking":
+                await self._flush_all()
+                self._current_kind = "thinking"
+            self._current_text += reasoning
+        if content:
+            if self._current_kind != "content":
+                await self._flush_all()
+                self._current_kind = "content"
+            self._current_text += content
+        if tool_calls:
+            await self._flush_text()
+            for tc in tool_calls:
+                i = tc.get("index", 0)
+                slot = self._tool_calls.setdefault(i, {"name": "", "arguments": ""})
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
+        cid = obj.get("id")
+        if cid:
+            self._last_chunk_id = cid
+
     async def _readany_once(self) -> bytes | None:
         data = await self._wrapped.content.readany()
         if not data:
-            await self._flush_all()
-            if self._buffer:
-                leftover = self._buffer
-                self._buffer = b""
-                return leftover
-            return b""
+            return await self._handle_eof()
         self._buffer += data
         outbound: list[bytes] = []
         while True:
-            crlf_idx = self._buffer.find(b"\r\n\r\n")
-            lf_idx = self._buffer.find(b"\n\n")
-            if crlf_idx == -1 and lf_idx == -1:
+            boundary = self._find_event_boundary(self._buffer)
+            if boundary is None:
                 break
-            if crlf_idx != -1 and (lf_idx == -1 or crlf_idx <= lf_idx):
-                idx, sep_len = crlf_idx, 4
-            else:
-                idx, sep_len = lf_idx, 2
+            idx, sep_len = boundary
             raw_event = self._buffer[: idx + sep_len]
             self._buffer = self._buffer[idx + sep_len:]
             event_text = raw_event.decode("utf-8", errors="replace").strip()
             if not event_text:
                 outbound.append(raw_event)
                 continue
-            # Extract payload line
-            payload = ""
-            for line in event_text.splitlines():
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
-            # Non-data lines, comments, [DONE] → pass through
+            payload = self._extract_payload(event_text)
             if not payload:
                 outbound.append(raw_event)
                 continue
@@ -301,62 +358,35 @@ class SSEChunkLogger:
                 outbound.append(raw_event)
                 continue
             # --- (a) existing logging on original delta ---
-            choices = obj.get("choices") or []
-            if choices:
-                delta = choices[0].get("delta") or {}
-                reasoning = delta.get("reasoning_content")
-                content = delta.get("content")
-                tool_calls = delta.get("tool_calls")
-                if reasoning:
-                    if self._current_kind != "thinking":
-                        await self._flush_all()
-                        self._current_kind = "thinking"
-                    self._current_text += reasoning
-                if content:
-                    if self._current_kind != "content":
-                        await self._flush_all()
-                        self._current_kind = "content"
-                    self._current_text += content
-                if tool_calls:
-                    await self._flush_text()
-                    for tc in tool_calls:
-                        i = tc.get("index", 0)
-                        slot = self._tool_calls.setdefault(i, {"name": "", "arguments": ""})
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["arguments"] += fn["arguments"]
-                # Track chunk id for synthesised events
-                cid = obj.get("id")
-                if cid:
-                    self._last_chunk_id = cid
+            await self._log_delta(obj)
             # --- (b) build outbound bytes with rescue transform ---
             outbound_event = self._transform_event(obj)
             outbound.append(outbound_event)
         return b"".join(outbound) if outbound else None
 
-    def _transform_event(self, obj: dict) -> bytes:
-        """Transform a single parsed event dict into outbound SSE bytes,
-        applying the rescue state machine."""
-        choices = obj.get("choices") or []
-        if not choices:
-            # No choices — pass through
-            body = json.dumps(obj, ensure_ascii=False)
-            return f"data: {body}\r\n\r\n".encode()
+    # ── transform helpers ──
 
-        delta = choices[0].get("delta") or {}
-        reasoning = delta.get("reasoning_content")
+    def _transform_pass_through(self, obj: dict) -> bytes:
+        """No-choices pass-through."""
+        body = json.dumps(obj, ensure_ascii=False)
+        return f"data: {body}\r\n\r\n".encode()
 
-        # If no reasoning_content, just rewrite finish_reason if needed
-        if not reasoning:
-            if self._rescued_any and choices[0].get("finish_reason") == "stop":
-                choices[0]["finish_reason"] = "tool_calls"
-            body = json.dumps(obj, ensure_ascii=False)
-            return f"data: {body}\r\n\r\n".encode()
+    def _transform_no_reasoning(self, obj: dict) -> bytes:
+        """No reasoning_content — rewrite finish_reason if needed."""
+        choices = obj["choices"]
+        if self._rescued_any and choices[0].get("finish_reason") == "stop":
+            choices[0]["finish_reason"] = "tool_calls"
+        body = json.dumps(obj, ensure_ascii=False)
+        return f"data: {body}\r\n\r\n".encode()
 
-        # Run rescue state machine on reasoning_content
-        work = self._reasoning_holdback + reasoning
+    def _run_rescue_loop(self, reasoning_text: str):
+        """Run the rescue state machine on reasoning_content.
+
+        Returns (prose_parts, synthesized) — prose_parts is a list[str] of
+        forwarded reasoning prose, synthesized is a list[bytes] of
+        tool-call SSE events.
+        """
+        work = self._reasoning_holdback + reasoning_text
         self._reasoning_holdback = ""
         prose_parts: list[str] = []
         synthesized: list[bytes] = []
@@ -409,14 +439,17 @@ class SSEChunkLogger:
                     self._rescue_buf += work
                     work = ""
 
-        # Build the outbound event
+        return prose_parts, synthesized
+
+    def _build_outbound_event(self, obj: dict, prose_parts: list[str], synthesized: list[bytes]) -> bytes:
+        """Build the outbound SSE event(s) after rescue processing."""
+        choices = obj["choices"]
+        delta = choices[0]["delta"]
         forwarded_reasoning = "".join(prose_parts)
         if forwarded_reasoning:
             delta["reasoning_content"] = forwarded_reasoning
         else:
             delta.pop("reasoning_content", None)
-            # If delta is now empty and has no other keys, we still emit the event
-            # (the caller handles skipping if needed)
 
         # Rewrite finish_reason if rescued
         if self._rescued_any and choices[0].get("finish_reason") == "stop":
@@ -428,6 +461,22 @@ class SSEChunkLogger:
         for syn in synthesized:
             result += syn
         return result
+
+    def _transform_event(self, obj: dict) -> bytes:
+        """Transform a single parsed event dict into outbound SSE bytes,
+        applying the rescue state machine."""
+        choices = obj.get("choices") or []
+        if not choices:
+            return self._transform_pass_through(obj)
+
+        delta = choices[0].get("delta") or {}
+        reasoning = delta.get("reasoning_content")
+        if not reasoning:
+            return self._transform_no_reasoning(obj)
+
+        prose_parts, synthesized = self._run_rescue_loop(reasoning)
+        return self._build_outbound_event(obj, prose_parts, synthesized)
+
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._wrapped, name)

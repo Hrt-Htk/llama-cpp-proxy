@@ -6,7 +6,7 @@ import asyncio
 import json
 import unittest
 
-import proxy
+from chat_logger import SSEChunkLogger
 
 
 # ---------------------------------------------------------------------------
@@ -92,14 +92,14 @@ def _split_sse_events(raw: bytes) -> list[dict]:
     return events
 
 
-def _make_logger(chunks: list[bytes]) -> proxy.SSEChunkLogger:
-    return proxy.SSEChunkLogger(FakeUpstream(chunks), FakeChatLogger())
+def _make_logger(chunks: list[bytes]) -> SSEChunkLogger:
+    return SSEChunkLogger(FakeUpstream(chunks), FakeChatLogger())
 
 
 async def _drive(chunks: list[bytes]) -> tuple[str, FakeChatLogger]:
     """Run SSEChunkLogger through all chunks, return (combined output, logger)."""
     logger = FakeChatLogger()
-    wrapped = proxy.SSEChunkLogger(FakeUpstream(chunks), logger)
+    wrapped = SSEChunkLogger(FakeUpstream(chunks), logger)
     out: list[bytes] = []
     while True:
         piece = await wrapped.readany()
@@ -399,7 +399,7 @@ class TestToolCallRescue(unittest.TestCase):
         blob += b"data: [DONE]\n\n"
 
         content = ChunkedContent(blob, slice_size=13)
-        wrapped = proxy.SSEChunkLogger(
+        wrapped = SSEChunkLogger(
             FakeUpstream([]),  # headers unused; we swap content
             FakeChatLogger(),
         )
@@ -450,7 +450,7 @@ class TestToolCallRescue(unittest.TestCase):
         blob += b"data: [DONE]\n\n"
 
         content = ChunkedContent(blob, slice_size=13)
-        wrapped = proxy.SSEChunkLogger(
+        wrapped = SSEChunkLogger(
             FakeUpstream([]),
             FakeChatLogger(),
         )
