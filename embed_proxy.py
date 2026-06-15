@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
-import os
 import secrets
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,11 +22,6 @@ from proxy_base import (
     filter_request_headers, filter_response_headers, health_handler, idle_watchdog,
 )
 from router_manager import RouterManager
-
-# Enable ANSI escape sequences on Windows 10+
-if sys.platform == "win32":
-    os.system("")
-
 
 ROOT = Path(__file__).resolve().parent
 SERVER_EXE = ROOT / "llama.cpp_latest" / "llama-server.exe"

@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from aiohttp.web_log import AccessLogger
@@ -23,6 +24,9 @@ from log_paths import (
     current_week_dir,
     local_now,
 )
+
+if TYPE_CHECKING:
+    from router_manager import RouterManager
 
 # Enable ANSI escape sequences on Windows 10+
 if sys.platform == "win32":
@@ -118,6 +122,8 @@ class ProxyConfig:
 
     @property
     def embed_base_url(self) -> str:
+        if self.embed_host is None or self.embed_port is None:
+            raise AttributeError("embed_host/embed_port not set on this config")
         host = self.embed_host
         if ":" in host:
             host = f"[{host}]"  # IPv6 needs brackets in URLs
@@ -222,7 +228,7 @@ def configure_logging(log_stem: str = "proxy") -> None:
 
 
 async def health_handler(request: web.Request) -> web.Response:
-    manager: ModelManager = request.app["manager"]
+    manager: RouterManager = request.app["manager"]
     return web.json_response({
         "status": "ok",
         "router": "running" if manager.server_running else "down",
@@ -231,7 +237,7 @@ async def health_handler(request: web.Request) -> web.Response:
     })
 
 
-async def idle_watchdog(manager: ModelManager) -> None:
+async def idle_watchdog(manager: RouterManager) -> None:
     while True:
         await asyncio.sleep(manager.config.idle_check_interval)
         try:

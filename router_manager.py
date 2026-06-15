@@ -10,7 +10,6 @@ import contextlib
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
@@ -20,9 +19,6 @@ from proxy_base import (
     ROOT,
     _is_dead_worker_response,
 )
-
-if TYPE_CHECKING:
-    pass  # keep for forward-ref stability
 
 # ── Module constants (chat-only — used only by ChatRouterManager methods) ──
 
@@ -39,7 +35,7 @@ class RouterManager:
     """Mirror of proxy.py's ModelManager, scoped to the embedding preset."""
 
     LOAD_TIMEOUT = 120
-    ROUTER_LABEL = "embed router"
+    ROUTER_LABEL = "embed router"  # base IS the embed manager; ChatRouterManager overrides to "router"
 
     def __init__(self, config: ProxyConfig, session: ClientSession) -> None:
         self.config = config
