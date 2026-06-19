@@ -51,3 +51,7 @@ build/
 .venv/
 venv/
 env/
+
+# Pi agent files
+.pi/
+_task.md

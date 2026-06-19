@@ -483,5 +483,82 @@ class TestToolCallRescue(unittest.TestCase):
         self.assertEqual(len(tc_finish), 1)
 
 
+    # 10. Literal mention of markers — must pass through unchanged
+    def test_literal_marker_mention(self) -> None:
+        """A sentence that literally mentions <function=read> is preserved as
+        reasoning_content — no tool_calls synthesized, finish_reason stays 'stop'."""
+        prose = (
+            "When you call it with `<function=read>` you get the file contents. "
+            "The closing tag is `</function>` and the wrapper is `</tool_call>`."
+        )
+        chunks = [
+            _sse_event({
+                "id": "req1", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"reasoning_content": prose}, "finish_reason": None}],
+            }),
+            _sse_event({
+                "id": "req1", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }),
+        ]
+        raw, _ = asyncio.run(_drive(chunks))
+        events = _split_sse_events(raw.encode())
+
+        # Combined reasoning must be intact
+        combined_reasoning = "".join(
+            e["choices"][0]["delta"].get("reasoning_content", "")
+            for e in events
+            if e.get("choices", [{}])[0].get("delta", {}).get("reasoning_content")
+        )
+        self.assertEqual(combined_reasoning, prose)
+
+        # No tool_calls synthesized
+        tc_events = [e for e in events if e.get("choices", [{}])[0].get("delta", {}).get("tool_calls")]
+        self.assertEqual(len(tc_events), 0)
+
+        # finish_reason stays "stop"
+        stop_events = [e for e in events if e.get("choices", [{}])[0].get("finish_reason") == "stop"]
+        self.assertEqual(len(stop_events), 1)
+
+    # 11. Literal mention of thinking/think tags — issue #8 regression
+    def test_issue8_literal_thinking_mention(self) -> None:
+        """Reasoning prose that literally discusses thinking/think XML tags is
+        preserved unchanged — no split, no tool_calls synthesized,
+        finish_reason stays 'stop'."""
+        prose = (
+            "Now I see the issue. The model is outputting `</thinking>` tags in the text content. "
+            "This is a model behavior issue where the model generates XML-like tags like "
+            "`<thinking>...</thinking>` or `<think>...</think>` in its raw output."
+        )
+        chunks = [
+            _sse_event({
+                "id": "req1", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"reasoning_content": prose}, "finish_reason": None}],
+            }),
+            _sse_event({
+                "id": "req1", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }),
+        ]
+        raw, _ = asyncio.run(_drive(chunks))
+        events = _split_sse_events(raw.encode())
+
+        # Combined reasoning must be intact — no split, no loss
+        combined_reasoning = "".join(
+            e["choices"][0]["delta"].get("reasoning_content", "")
+            for e in events
+            if e.get("choices", [{}])[0].get("delta", {}).get("reasoning_content")
+        )
+        self.assertEqual(combined_reasoning, prose)
+
+        # No tool_calls synthesized
+        tc_events = [e for e in events if e.get("choices", [{}])[0].get("delta", {}).get("tool_calls")]
+        self.assertEqual(len(tc_events), 0)
+
+        # finish_reason stays "stop" exactly once
+        stop_events = [e for e in events if e.get("choices", [{}])[0].get("finish_reason") == "stop"]
+        self.assertEqual(len(stop_events), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
