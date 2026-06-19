@@ -212,6 +212,8 @@ class SSEChunkLogger:
             except (json.JSONDecodeError, ValueError):
                 pass
             args[key] = value
+        if not args:
+            return None  # bare <function=NAME> without parameters is not a tool call
         return {"name": name, "arguments": args}
 
     def _build_synthesized_event(self, parsed: dict) -> bytes:
@@ -430,6 +432,9 @@ class SSEChunkLogger:
                     if parsed:
                         synthesized.append(self._build_synthesized_event(parsed))
                         self._rescued_any = True
+                    else:
+                        # Not a genuine tool call — return captured text to prose
+                        prose_parts.append(self._rescue_buf)
                     self._rescue_capturing = False
                     self._rescue_buf = ""
                     self._rescue_kind = None
