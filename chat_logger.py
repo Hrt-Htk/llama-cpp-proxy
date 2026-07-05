@@ -19,6 +19,7 @@ from log_paths import (
 
 
 RAW_BODY_CAP = 1024 * 1024
+THINK_LEAK_WINDOW = 4096  # bytes of accumulated content text
 
 
 class ChatLogger:
@@ -156,6 +157,12 @@ class SSEChunkLogger:
         self._rescue_index: int = 0
         # cache upstream chunk id for synthesised events
         self._last_chunk_id: str = "rescued"
+        # --- content-side think-leak buffer (Fix 1) ---
+        self._content_buffer_active: bool = False
+        self._content_buf: str = ""
+        self._content_buffer_decided: bool = False
+        # --- buffered finish event (Fix 2 — defer until truncated rescue resolves) ---
+        self._pending_finish: bytes | None = None
 
     async def _flush_text(self) -> None:
         if self._current_kind and self._current_text:
@@ -259,14 +266,47 @@ class SSEChunkLogger:
 
     # ── read loop helpers ──
 
+    def _resolve_stream_end(self) -> bytes:
+        """Resolve all held state at end of stream ([DONE] or EOF): flush the
+        content buffer, attempt the truncated tool-call rescue, and release or
+        drop the held finish event. Idempotent — safe to call from both the
+        [DONE] path and _handle_eof."""
+        outbound: list[bytes] = []
+
+        # Flush content buffer (Fix 1)
+        if self._content_buffer_active and not self._content_buffer_decided and self._content_buf:
+            flush_bytes = self._flush_content_buffer()
+            if flush_bytes:
+                outbound.append(flush_bytes)
+
+        # Try truncated rescue (Fix 2)
+        rescued_succeeded = False
+        if self._rescue_capturing and self._rescue_buf:
+            synthesized = self._try_rescue_truncated()
+            if synthesized:
+                outbound.append(synthesized)
+                rescued_succeeded = True
+
+        # Emit the held finish event only if the truncated rescue didn't
+        # replace it with its own finish_reason=tool_calls event.
+        if self._pending_finish:
+            if not rescued_succeeded:
+                outbound.append(self._pending_finish)
+            self._pending_finish = None
+
+        return b"".join(outbound)
+
     async def _handle_eof(self) -> bytes | None:
         """Handle EOF: flush buffers and return any leftover."""
         await self._flush_all()
+        outbound: list[bytes] = [self._resolve_stream_end()]
+
         if self._buffer:
             leftover = self._buffer
             self._buffer = b""
-            return leftover
-        return b""
+            outbound.append(leftover)
+
+        return b"".join(outbound)
 
     @staticmethod
     def _find_event_boundary(buffer: bytes):
@@ -310,10 +350,11 @@ class SSEChunkLogger:
                 self._current_kind = "thinking"
             self._current_text += reasoning
         if content:
-            if self._current_kind != "content":
-                await self._flush_all()
-                self._current_kind = "content"
-            self._current_text += content
+            if not self._content_buffer_active:
+                if self._current_kind != "content":
+                    await self._flush_all()
+                    self._current_kind = "content"
+                self._current_text += content
         if tool_calls:
             await self._flush_text()
             for tc in tool_calls:
@@ -352,6 +393,11 @@ class SSEChunkLogger:
             if payload == "[DONE]":
                 await self._flush_all()
                 await self._chat_logger.log_response("[DONE]", True)
+                # Resolve any held state BEFORE forwarding [DONE]: clients
+                # stop reading at [DONE], so buffered content, a pending
+                # truncated-tool-call rescue, and a held finish event must
+                # all be emitted ahead of it.
+                outbound.append(self._resolve_stream_end())
                 outbound.append(raw_event)
                 continue
             try:
@@ -364,7 +410,12 @@ class SSEChunkLogger:
             # --- (b) build outbound bytes with rescue transform ---
             outbound_event = self._transform_event(obj)
             outbound.append(outbound_event)
-        return b"".join(outbound) if outbound else None
+        # readany()'s contract: b"" means EOF. A transform may legitimately
+        # swallow an event (held finish, buffered content) and produce no
+        # bytes — report None so the read loop keeps going instead of
+        # signalling a premature end-of-stream.
+        joined = b"".join(outbound)
+        return joined if joined else None
 
     # ── transform helpers ──
 
@@ -467,17 +518,183 @@ class SSEChunkLogger:
             result += syn
         return result
 
+    # ── Fix 1: content-side think-leak buffer ──
+
+    @staticmethod
+    def _find_closing_tag_line_index(text: str) -> int | None:
+        """Find the line index of a standalone "</think>" line outside code fences.
+
+        Returns the 0-based line index or None if not found.
+        The tag line must be complete (terminated by \n or end-of-string).
+        """
+        lines = text.split("\n")
+        in_fence = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence and stripped == "</think>":
+                return i
+        return None
+
+    def _flush_content_buffer(self) -> bytes:
+        """Flush the content buffer, possibly splitting at "</think>" tag.
+
+        Returns outbound SSE event bytes (reasoning event, content event, or both).
+        """
+        buf = self._content_buf
+        self._content_buf = ""
+        self._content_buffer_decided = True
+
+        tag_line_idx = self._find_closing_tag_line_index(buf)
+        if tag_line_idx is not None:
+            lines = buf.split("\n")
+            before_lines = lines[:tag_line_idx]
+            after_lines = lines[tag_line_idx + 1:]
+
+            reasoning_text = "\n".join(before_lines)
+            if reasoning_text and not reasoning_text.endswith("\n"):
+                reasoning_text += "\n"
+
+            after_text = "\n".join(after_lines)
+            after_text = after_text.lstrip("\n")
+
+            reasoning_event = self._build_content_buffer_event(
+                reasoning_content=reasoning_text
+            )
+
+            if after_text:
+                content_event = self._build_content_buffer_event(
+                    content=after_text
+                )
+                return reasoning_event + content_event
+            return reasoning_event
+        else:
+            if buf:
+                return self._build_content_buffer_event(content=buf)
+            return b""
+
+    def _build_content_buffer_event(self, reasoning_content="", content="") -> bytes:
+        """Build a synthetic SSE event for content buffer output."""
+        obj = {
+            "id": self._last_chunk_id,
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            }],
+        }
+        delta = obj["choices"][0]["delta"]
+        if reasoning_content:
+            delta["reasoning_content"] = reasoning_content
+        if content:
+            delta["content"] = content
+        body = json.dumps(obj, ensure_ascii=False)
+        return ("data: " + body + "\r\n\r\n").encode()
+
+    def _handle_content_delta(self, content_text: str) -> bytes | None:
+        """Process a content delta through the think-leak buffer.
+
+        Returns outbound SSE event bytes if the buffer was flushed,
+        or None if still buffering.
+        """
+        if self._content_buffer_decided:
+            return None
+
+        self._content_buf += content_text
+        buf_bytes = len(self._content_buf.encode("utf-8"))
+
+        if buf_bytes >= THINK_LEAK_WINDOW:
+            return self._flush_content_buffer()
+
+        if self._find_closing_tag_line_index(self._content_buf) is not None:
+            return self._flush_content_buffer()
+
+        return None
+
+    # ── Fix 2: truncated tool-call rescue at EOF ──
+
+    def _try_rescue_truncated(self) -> bytes | None:
+        """Try to synthesize a tool call from an incomplete capture at EOF.
+
+        Returns synthesized SSE event bytes if successful, None otherwise.
+        """
+        buf = self._rescue_buf
+        import re as _re
+        m = _re.search(r"<function=([^>\s]+)", buf)
+        if not m:
+            return None
+
+        fn_end = buf.find("</function>")
+        if fn_end == -1:
+            return None
+
+        residue = buf[fn_end + len("</function>"):]
+        trimmed_residue = residue.strip()
+        closing_tag = "</tool_call>"
+        if not closing_tag.startswith(trimmed_residue):
+            return None
+
+        block = buf[:fn_end + len("</function>")]
+        parsed = self._parse_tool_call_xml(block)
+        if not parsed:
+            return None
+
+        synthesized = self._build_synthesized_event(parsed)
+        self._rescued_any = True
+
+        self._rescue_capturing = False
+        self._rescue_buf = ""
+        self._rescue_kind = None
+
+        finish_obj = {
+            "id": self._last_chunk_id,
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls",
+            }],
+        }
+        finish_bytes = ("data: " + json.dumps(finish_obj, ensure_ascii=False) + "\r\n\r\n").encode()
+
+        return synthesized + finish_bytes
+
     def _transform_event(self, obj: dict) -> bytes:
         """Transform a single parsed event dict into outbound SSE bytes,
-        applying the rescue state machine."""
+        applying the rescue state machine and content-side think-leak buffer."""
         choices = obj.get("choices") or []
         if not choices:
             return self._transform_pass_through(obj)
 
         delta = choices[0].get("delta") or {}
+        content = delta.get("content")
         reasoning = delta.get("reasoning_content")
+
+        if content is not None and not self._content_buffer_decided:
+            self._content_buffer_active = True
+            result = self._handle_content_delta(content)
+            if result is not None:
+                return result
+            # Still buffering — swallow the content from this event; anything
+            # else it carries (finish_reason etc.) falls through below.
+            delta.pop("content", None)
+
         if not reasoning:
-            return self._transform_no_reasoning(obj)
+            finish_reason = choices[0].get("finish_reason")
+            # A finish event resolves the content buffer first, so rerouted or
+            # flushed text is emitted before the finish_reason reaches clients.
+            prefix = b""
+            if finish_reason and self._content_buffer_active and not self._content_buffer_decided:
+                prefix = self._flush_content_buffer()
+            # Hold finish events while a rescue capture is pending — the
+            # truncated-rescue at EOF may need to rewrite the finish_reason.
+            if finish_reason and self._rescue_capturing:
+                self._pending_finish = self._transform_no_reasoning(obj)
+                return prefix
+            return prefix + self._transform_no_reasoning(obj)
 
         prose_parts, synthesized = self._run_rescue_loop(reasoning)
         return self._build_outbound_event(obj, prose_parts, synthesized)
