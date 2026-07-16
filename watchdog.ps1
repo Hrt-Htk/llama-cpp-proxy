@@ -8,6 +8,12 @@
 # --model and --ctx-size only set the fallback when a client omits the model.
 
 $ErrorActionPreference = "Stop"
+
+# Stable console title so the daily restart scripts can find this window by
+# title (matches *watchdog*, and deliberately contains no "embed" so the chat
+# restart never catches the embed watchdog). Also survives minimized launches.
+$host.UI.RawUI.WindowTitle = "llama-chat-watchdog"
+
 $scriptDir = Split-Path $PSCommandPath -Parent
 $python    = Join-Path $scriptDir ".venv\Scripts\python.exe"
 $proxy     = Join-Path $scriptDir "proxy.py"

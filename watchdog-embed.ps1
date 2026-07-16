@@ -2,6 +2,12 @@
 # Usage: .\watchdog-embed.ps1 [extra args forwarded to embed_proxy.py]
 
 $ErrorActionPreference = "Stop"
+
+# Stable console title so the daily restart scripts can find this window by
+# title (matches *embed*, and deliberately contains no "watchdog" so the chat
+# restart never catches this window). Also survives minimized launches.
+$host.UI.RawUI.WindowTitle = "llama-embed-supervisor"
+
 $scriptDir = Split-Path $PSCommandPath -Parent
 $python    = Join-Path $scriptDir ".venv\Scripts\python.exe"
 $proxy     = Join-Path $scriptDir "embed_proxy.py"
