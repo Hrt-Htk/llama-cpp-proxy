@@ -71,9 +71,9 @@ if (-not $found) {
 # --- Brief pause before restart to let ports fully release ---
 Start-Sleep -Seconds 3
 
-# --- Launch fresh embed watchdog in a visible console ---
+# --- Launch fresh embed watchdog in a minimized console ---
 Log "Starting fresh embed watchdog"
-Start-Process powershell -WindowStyle Normal `
+Start-Process powershell -WindowStyle Minimized `
     -ArgumentList "-NoExit", "-NoProfile", "-File", "`"$watchdog`"" `
     -WorkingDirectory $scriptDir
 
