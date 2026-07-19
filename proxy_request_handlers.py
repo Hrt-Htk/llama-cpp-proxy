@@ -25,9 +25,17 @@ from proxy_config import RETRY_AFTER_SECONDS
 # forwarded it to a dead/hung model-worker child, and never responded, while the
 # proxy awaited with timeout=None and hung forever. A hung worker is
 # indistinguishable from an infinitely-slow one, so — like nginx's
-# proxy_read_timeout — we bound the wait. Generous enough that a cold model load
-# (~15-25s) is never mistaken for a hang. Override via $PROXY_FIRST_BYTE_TIMEOUT.
-FIRST_BYTE_TIMEOUT = float(os.environ.get("PROXY_FIRST_BYTE_TIMEOUT", "60"))
+# proxy_read_timeout — we bound the wait.
+#
+# CALIBRATION (measured 2026-07-19): this router withholds response headers until
+# the worker emits its first token, so time-to-headers includes the full prompt
+# *prefill*. A near-limit cold-cache prefill (131k tokens at ~800 tok/s) takes
+# ~165s. A 60s bound false-tripped on large contexts and forced needless worker
+# reloads (losing the prompt cache, which can cascade). So the bound must sit
+# above the worst-case legitimate prefill: 240s covers a full-context cold prefill
+# with margin, while a genuinely hung worker is still detected (just later).
+# Override via $PROXY_FIRST_BYTE_TIMEOUT.
+FIRST_BYTE_TIMEOUT = float(os.environ.get("PROXY_FIRST_BYTE_TIMEOUT", "240"))
 
 
 def _strip_chat_prefix(path: str) -> str:
