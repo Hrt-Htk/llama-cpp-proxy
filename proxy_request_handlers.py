@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
 import time
 
@@ -18,6 +19,15 @@ from proxy_base import (
 from router_manager import ChatRouterManager
 from chat_logger import ChatLogger, SSEChunkLogger
 from proxy_config import RETRY_AFTER_SECONDS
+
+# Max seconds to wait for the router to send *response headers* before treating
+# the worker as hung. The 2026-07-19 incident: the router accepted a completion,
+# forwarded it to a dead/hung model-worker child, and never responded, while the
+# proxy awaited with timeout=None and hung forever. A hung worker is
+# indistinguishable from an infinitely-slow one, so — like nginx's
+# proxy_read_timeout — we bound the wait. Generous enough that a cold model load
+# (~15-25s) is never mistaken for a hang. Override via $PROXY_FIRST_BYTE_TIMEOUT.
+FIRST_BYTE_TIMEOUT = float(os.environ.get("PROXY_FIRST_BYTE_TIMEOUT", "60"))
 
 
 def _strip_chat_prefix(path: str) -> str:
@@ -217,10 +227,31 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         paths (success, 4xx, SSE) stream zero-copy as before.
         """
         try:
-            upstream_resp = await session.request(
-                request.method, target_url, headers=headers,
-                data=body, allow_redirects=False, timeout=None,
-            )
+            # Bound the wait for *response headers*. A hung worker makes the
+            # router accept the request and never respond; without this bound
+            # the await hangs forever (timeout=None) and the dead-worker
+            # recovery below is never reached. On timeout we synthesize a
+            # DeadWorkerError so the retry loop cycles the worker, exactly as it
+            # does for a router-reported dead-worker 5xx. Streaming after the
+            # headers keeps its own per-chunk keep-alive timeout, so this only
+            # guards time-to-first-response, not generation length.
+            try:
+                upstream_resp = await asyncio.wait_for(
+                    session.request(
+                        request.method, target_url, headers=headers,
+                        data=body, allow_redirects=False, timeout=None,
+                    ),
+                    timeout=FIRST_BYTE_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logging.warning(
+                    "[req=%s] no response headers from router within %.0fs — "
+                    "treating worker as hung", req_id, FIRST_BYTE_TIMEOUT,
+                )
+                raise DeadWorkerError(
+                    504, b"router sent no response within first-byte timeout "
+                         b"(worker hung)",
+                )
             is_sse = "text/event-stream" in upstream_resp.headers.get("Content-Type", "")
 
             # Pre-read non-SSE error bodies BEFORE prepare() so we can inspect
@@ -296,6 +327,16 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         else:
             # Non-model endpoints (health, /v1/models, props, …) forward directly.
             return await _do_forward()
+    except DeadWorkerError as exc:
+        # Only reachable on the non-model path (the retry loop handles it for
+        # model requests). A hung worker starving a metadata request → 503.
+        logging.warning("[req=%s] upstream unresponsive on non-model path: %r",
+                        req_id, exc.body[:120])
+        return web.json_response(
+            {"error": "backend unavailable", "detail": "upstream unresponsive"},
+            status=503,
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS), "X-Request-ID": req_id},
+        )
     finally:
         manager.end_request()
 
