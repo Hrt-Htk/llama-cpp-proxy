@@ -18,6 +18,7 @@ from proxy_base import API_KEY, ProxyConfig
 ROOT = Path(__file__).resolve().parent
 SERVER_EXE = ROOT / "llama.cpp_latest" / "llama-server.exe"
 PRESET_PATH = ROOT / "models-preset.ini"
+DEFAULT_CHAT_TEMPLATE = ROOT / "chat_template.jinja"  # used by any model without its own
 
 # Each (model, ctx) pair becomes its own preset section so the router
 # exposes them as distinct models that the pi-llama-cpp extension can
@@ -30,29 +31,31 @@ class ModelChoice:
     model_file: Path    # GGUF weights
     mmproj_file: Path   # multimodal projector
     spec_mtp: bool = False  # enable built-in MTP speculative decoding (draft-mtp)
+    mmproj_offload: bool = True  # False → run projector on CPU/RAM (frees ~1.1 GB VRAM;
+                                 # image encode moves to CPU, only on image turns)
+    chat_template_file: Path | None = None  # per-model template; overrides the
+                                            # router-global --chat-template-file
+    ctx_choices: tuple[int, ...] | None = None  # per-model ctx list; None → global CTX_CHOICES
 
     def preset_id(self, ctx: int) -> str:
         return f"{self.base_id}-{ctx // 1024}k"
 
+    def contexts(self, default: list[int]) -> tuple[int, ...] | list[int]:
+        return self.ctx_choices if self.ctx_choices is not None else default
 
+
+# Two production models, each exposed at a single 262k preset. Both fit the
+# 3090 Ti alone at full context with the projector on CPU (mmproj_offload=False);
+# see docs/dev/model-acceptance.md. Retired presets (base 35B A3B Q3/Q4, 27B MTP,
+# and all sub-262k ctx variants) — weights remain on disk, just no longer served.
 MODELS: list[ModelChoice] = [
     ModelChoice(
-        "Qwen3.6-35B-A3B Q3",
-        "qwen3.6-35b-q3",
-        ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+        "Nail-Qwen3.6-35B-A3B Q4",
+        "nail-35b-a3b-q4",
+        ROOT / "models" / "Nail-Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         ROOT / "models" / "_aux" / "mmproj-F16.gguf",
-    ),
-    ModelChoice(
-        "Qwen3.6-35B-A3B Q4",
-        "qwen3.6-35b-q4",
-        ROOT / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-        ROOT / "models" / "_aux" / "mmproj-F16.gguf",
-    ),
-    ModelChoice(
-        "Qwen3.6-27B Q4",
-        "qwen3.6-27b-q4",
-        ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-        ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
+        mmproj_offload=False,
+        chat_template_file=ROOT / "chat_template_sharp.jinja",
     ),
     ModelChoice(
         "Qwen3.6-27B Q4 MTP",
@@ -60,10 +63,14 @@ MODELS: list[ModelChoice] = [
         ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf",
         ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
         spec_mtp=True,
+        mmproj_offload=False,
+        # MTP draft buffers add ~1.7 GB, so full 262k leaves only ~300 MiB —
+        # too tight for the prefill spike. 224k is the safe max (~1 GB headroom).
+        ctx_choices=(229376,),
     ),
 ]
 
-CTX_CHOICES: list[int] = [32768, 65536, 98304, 131072]
+CTX_CHOICES: list[int] = [262144]
 
 PROXY_HOST = "0.0.0.0"
 PROXY_PORT = 8001
@@ -90,12 +97,11 @@ class ChatProxyConfig(ProxyConfig):
             "--models-preset", str(PRESET_PATH),
             "--models-max", "1",
             "--no-models-autoload",
-            # --- perf A/B test: chat-template flags (see chat_template_perf_test.md) ---
-            # Variant D: full new config (jinja + custom template + preserve_thinking kwarg)
+            # Chat template is set PER-PRESET (chat-template-file in each section),
+            # not globally: a router-global --chat-template-file overrides every
+            # preset's own template, which would deny Nail its froggeric template.
+            # Both templates default preserve_thinking=true, so no global kwarg needed.
             "--jinja",
-            "--chat-template-file", str(ROOT / "chat_template.jinja"),
-            "--chat-template-kwargs", '{"preserve_thinking":true}',
-            # ------------------------------------------------------------------------
             "--host", self.server_host,
             "--port", str(self.server_port),
             "--api-key", self.api_key,
@@ -142,6 +148,9 @@ def _model_preset_section(model: ModelChoice, ctx: int) -> str:
         if model.spec_mtp
         else ""
     )
+    mmproj_off = "" if model.mmproj_offload else "mmproj-offload = off\n"
+    tmpl_path = model.chat_template_file or DEFAULT_CHAT_TEMPLATE
+    template = f"chat-template-file = {tmpl_path.as_posix()}\n"
     return (
         f"[{model.preset_id(ctx)}]\n"
         f"model         = {model.model_file.as_posix()}\n"
@@ -157,6 +166,8 @@ def _model_preset_section(model: ModelChoice, ctx: int) -> str:
         f"temp          = 0.6\n"
         f"top-p         = 0.95\n"
         f"top-k         = 20\n"
+        + mmproj_off
+        + template
         + spec
     )
 
@@ -171,7 +182,7 @@ def write_preset(models: list[ModelChoice], ctx_choices: list[int]) -> None:
     sections = [
         _model_preset_section(m, ctx)
         for m in models
-        for ctx in ctx_choices
+        for ctx in m.contexts(ctx_choices)
     ]
     content = "\n".join(sections) + "\n"
     PRESET_PATH.write_text(content, encoding="utf-8")
@@ -208,8 +219,9 @@ def build_config() -> ProxyConfig:
     model, ctx = pick_setup(args.model, args.ctx_size)
     write_preset(MODELS, CTX_CHOICES)
     default_id = model.preset_id(ctx)
+    n_presets = sum(len(m.contexts(CTX_CHOICES)) for m in MODELS)
     print(f"Default: {model.label} @ {ctx // 1024}k ctx (id: {default_id})")
-    print(f"Exposed presets: {len(MODELS) * len(CTX_CHOICES)} (one per model×ctx combo)")
+    print(f"Exposed presets: {n_presets} (one per model×ctx combo)")
 
     return ChatProxyConfig(
         proxy_host=args.proxy_host,

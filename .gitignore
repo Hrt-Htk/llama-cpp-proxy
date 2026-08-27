@@ -55,3 +55,8 @@ env/
 # Pi agent files
 .pi/
 _task.md
+_pi_tasks/
+
+# Generated test artifacts (harness output; regenerated per run)
+tests/_assets/
+tests/acceptance-results/
