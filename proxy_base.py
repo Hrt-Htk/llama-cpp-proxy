@@ -153,14 +153,14 @@ def filter_response_headers(headers) -> dict[str, str]:
 
 # Reverse-proxy hops allowed to set forwarding headers. We listen on
 # 0.0.0.0:8001, so a direct LAN client could spoof X-Forwarded-For /
-# CF-Connecting-IP; only trust those headers when the TCP peer is Caddy (LAN
-# front) or cloudflared (loopback). Override the Caddy IP via $TRUSTED_PROXY.
+# CF-Connecting-IP; only trust those headers when the TCP peer is Caddy (ZBOX
+# front) or loopback. Override the Caddy IP via $TRUSTED_PROXY.
 TRUSTED_PROXIES = {"127.0.0.1", "::1", os.environ.get("TRUSTED_PROXY", "192.168.178.43")}
 
 
 def client_ip(request: web.Request) -> str:
     """Real client IP. When the request arrives from a trusted reverse proxy
-    (Caddy on the LAN, or cloudflared on loopback) we read the forwarded client
+    (Caddy on the ZBOX, or a loopback tool) we read the forwarded client
     out of CF-Connecting-IP / X-Forwarded-For; otherwise we report the raw TCP
     peer. Untrusted peers can't spoof their way to a fake IP."""
     peer = request.remote or "-"
@@ -185,7 +185,7 @@ class ForwardedAccessLogger(AccessLogger):
         return client_ip(request)
 
 
-# Paths reachable without an API key. /health is the cloudflared/uptime probe.
+# Paths reachable without an API key. /health is the uptime probe.
 PUBLIC_PATHS = {"/health"}
 
 
@@ -193,8 +193,8 @@ PUBLIC_PATHS = {"/health"}
 async def auth_middleware(request: web.Request, handler):
     """Reject any request that doesn't carry the configured API key.
 
-    This proxy is the internet-facing origin for the Cloudflare tunnel, so
-    it — not the localhost-only llama-server behind it — is where client
+    This proxy is the front-facing origin (the ZBOX's Caddy forwards to it),
+    so it — not the localhost-only llama-server behind it — is where client
     authentication has to happen. filter_request_headers() still injects the
     key on the *upstream* hop so the backend keeps trusting only this proxy.
     """

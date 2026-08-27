@@ -29,13 +29,13 @@ PRESET_PATH = ROOT / "embed-preset.ini"
 
 # Single embedding model. Wrapped in the same router-mode pattern as
 # proxy.py so the embedder can be unloaded after idle while the router
-# stays up — cloudflared keeps a stable origin.
+# stays up — the front-end (ZBOX Caddy) keeps a stable origin.
 MODEL_FILE = ROOT / "models" / "Qwen3-Embedding-4B-Q8_0.gguf"
 MODEL_ID = "qwen3-embedding-4b-8k"
 CTX_SIZE = 8192
 
 PROXY_HOST = "::"
-PROXY_PORT = 8003          # cloudflared origin (embed.example.com)
+PROXY_PORT = 8003          # internal; clients reach it via proxy.py /embedding/*
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8004         # internal router
 IDLE_TIMEOUT = 600

@@ -13,6 +13,7 @@
 
 # Temp and cache
 .tmp/
+tmp/
 __pycache__/
 *.pyc
 *.pyo

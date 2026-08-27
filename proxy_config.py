@@ -58,14 +58,15 @@ MODELS: list[ModelChoice] = [
         chat_template_file=ROOT / "chat_template_sharp.jinja",
     ),
     ModelChoice(
-        "Qwen3.6-27B Q4 MTP",
-        "qwen3.6-27b-q4-mtp",
-        ROOT / "models" / "Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf",
-        ROOT / "models" / "_aux" / "mmproj-27b-BF16.gguf",
+        "Qwen3.8-27B Q4 MTP",
+        "qwen3.8-27b-q4-mtp",
+        ROOT / "models" / "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        ROOT / "models" / "_aux" / "mmproj-qwen38-27b-F16.gguf",
         spec_mtp=True,
         mmproj_offload=False,
-        # MTP draft buffers add ~1.7 GB, so full 262k leaves only ~300 MiB —
-        # too tight for the prefill spike. 224k is the safe max (~1 GB headroom).
+        # Inherited 224k cap from the 3.6-27B MTP preset (draft buffers add ~1.7 GB).
+        # 3.8 only keeps a KV cache on 16/64 layers, so 262k may now fit — re-test
+        # with `model_acceptance.py --full-ctx` before raising this.
         ctx_choices=(229376,),
     ),
 ]

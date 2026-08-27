@@ -216,7 +216,7 @@ class ChatRouterManager(RouterManager):
 
     The router process starts with the proxy and dies with it. Models are
     loaded on first request and unloaded by the idle watchdog — the router
-    itself stays up so the cloudflared tunnel never breaks.
+    itself stays up so the front-end connection never breaks.
     """
 
     LOAD_TIMEOUT = 300
