@@ -1,4 +1,4 @@
-# Shared log-path helpers for PowerShell wrappers (watchdogs + tunnel runner).
+# Shared log-path helpers for PowerShell wrappers (watchdogs).
 # Mirrors log_paths.py: writes into logs/<YYYY-WNN>/ buckets (local Europe/Zurich
 # date), and prunes any week folder older than the two most recent.
 #

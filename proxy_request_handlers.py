@@ -301,7 +301,7 @@ async def proxy_request(request: web.Request) -> web.StreamResponse:
         except DeadWorkerError:
             raise  # propagate to retry loop
         except ClientGone:
-            # Downstream client (cloudflared / end client) hung up before we finished
+            # Downstream client (front proxy / end client) hung up before we finished
             # sending the response — raised when downstream.prepare() hit a closing
             # transport. Same benign disconnect the write loops already handle, just
             # earlier. Not a proxy fault, so log calmly and return 499.

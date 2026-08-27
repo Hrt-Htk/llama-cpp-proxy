@@ -1,17 +1,19 @@
 # llama.cpp Wake-on-Demand Proxy
 
-Two `llama-server.exe` router instances behind small Python proxies, exposed over a
-cloudflared tunnel under a single hostname. `proxy.py` reverse-proxies `/embedding/*`
-to the embed stack. Each proxy loads its model on first request and unloads after
-10 minutes of inactivity — the router process stays up so the tunnel never breaks.
+Two `llama-server.exe` router instances behind small Python proxies. `proxy.py`
+listens on `0.0.0.0:8001` and reverse-proxies `/embedding/*` to the embed stack.
+No tunnel runs on this box — the ZBOX's Caddy is the entry point and forwards
+to :8001. Each proxy loads its model on first request and unloads after
+10 minutes of inactivity — the router process stays up so the front-end
+connection never breaks.
 
 ```
-ai.example.com/chat/*       → :8001 proxy.py     → :8002 router (chat)
-ai.example.com/embedding/*  → :8001 proxy.py     → :8003 embed_proxy.py → :8004 router (embeddings)
+:8001 proxy.py      → :8002 router (chat)
+:8001 /embedding/*  → :8003 embed_proxy.py → :8004 router (embeddings)
 ```
 
-Bare `ai.example.com/v1/...` at the root also still hits the chat router
-(backwards compat); the `/chat` prefix is the preferred public alias.
+Bare `/v1/...` at the root also still hits the chat router
+(backwards compat); the `/chat` prefix is the preferred alias.
 Both stacks run side-by-side as independent processes; both models can be loaded
 concurrently.
 
@@ -67,20 +69,22 @@ H:\llama.cpp\watchdog-embed.ps1            # embed stack on :8003
 H:\llama.cpp\create-scheduler-tasks.ps1    # run once as Administrator
 ```
 
-**Public tunnel** — `cloudflared` is set up separately (outside this repo). Install `cloudflared.exe`, configure your tunnel in `~/.cloudflared/config.yml`, then run it however you prefer.
+**Entry point** — the ZBOX (`htk-ZBOX-PI336`, LAN 192.168.178.43 / Tailscale
+100.80.201.44) runs Caddy, which forwards to `:8001` on this box. No tunnel
+runs on this machine.
 
 Headless chat variant (skip the interactive picker — sets the *fallback* model
-when a client request omits the `model` field; all combos are still routable):
+when a client request omits the `model` field; all presets are still routable):
 
 ```powershell
-H:\llama.cpp\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768
+H:\llama.cpp\watchdog.ps1 --model "Nail-Qwen3.6-35B-A3B Q4"
 ```
 
 ## Endpoints
 
-- **Chat:** `https://ai.example.com/chat/v1/chat/completions` — model field selects preset (e.g. `qwen3.6-35b-q3-32k`).
-- **Embeddings:** `https://ai.example.com/embedding/v1/embeddings` — model `qwen3-embedding-4b-8k`.
-- **Re-ranking:** `https://ai.example.com/embedding/v1/rerank` — same embed router.
+- **Chat:** `/chat/v1/chat/completions` (via the ZBOX entry point) — model field selects preset (e.g. `nail-35b-a3b-q4-262k`).
+- **Embeddings:** `/embedding/v1/embeddings` — model `qwen3-embedding-4b-8k`.
+- **Re-ranking:** `/embedding/v1/rerank` — same embed router.
 - Both require `Authorization: Bearer <key>`. Set via `$env:LLAMA_API_KEY` (overrides the hardcoded fallback in the proxy code).
 
 `/health` on either port reports proxy + router state and which model is currently loaded.
@@ -89,18 +93,18 @@ H:\llama.cpp\watchdog.ps1 --model "Qwen3.6-35B-A3B Q3" --ctx-size 32768
 
 1. Watchdog starts the proxy. Proxy spawns the router with `--no-models-autoload` and `--models-max 1`. GPU is idle, router is healthy.
 2. First chat/embedding request arrives. Proxy POSTs `/models/load` to the router, polls `/v1/models` until `status.value == "loaded"`, then forwards.
-3. Idle watchdog (inside each proxy) checks every 30s. After 10 minutes of no activity it POSTs `/models/unload`. VRAM frees; router stays running; tunnel socket stays alive.
+3. Idle watchdog (inside each proxy) checks every 30s. After 10 minutes of no activity it POSTs `/models/unload`. VRAM frees; router stays running; front-end connection stays alive.
 4. Next request reloads on demand.
 
 Cold-load latency: ~15–20s for the 35B chat model on a 3090 Ti; ~2–3s for the 4B embedder.
 
 ## Adding a model
 
-Chat side — append a `ModelChoice(...)` to `MODELS` in `proxy.py`. Every entry is automatically crossed with `CTX_CHOICES` (32k, 64k, 96k, 128k) to produce one preset per (model × ctx) pair. No INI editing.
+Chat side — append a `ModelChoice(...)` to `MODELS` in `proxy_config.py`. Every entry is crossed with `CTX_CHOICES` (currently a single 262k) to produce one preset per (model × ctx) pair; a model can pin its own `ctx_choices` to override. No INI editing.
 
 Each preset uses KV cache quantization (`cache-type-k = q4_0`, `cache-type-v = q4_0`), flash attention, and a custom Jinja chat template (`chat_template.jinja` with `preserve_thinking` kwarg).
 
-**MTP (speculative decoding)** — set `spec_mtp=True` on a `ModelChoice` to enable built-in MTP speculative decoding. This emits `spec-type=draft-mtp`, `spec-draft-n-max=2`, `spec-draft-p-min=0.0` in the preset. Requires the b9209+ router binary (PR ggml-org/llama.cpp#22673). The 27B model has an MTP variant (`qwen3.6-27b-q4-mtp`) that uses `models/Qwen3.6-27B-UD-Q4_K_XL.mtp.gguf`.
+**MTP (speculative decoding)** — set `spec_mtp=True` on a `ModelChoice` to enable built-in MTP speculative decoding. This emits `spec-type=draft-mtp`, `spec-draft-n-max=2`, `spec-draft-p-min=0.0` in the preset. Requires the b9209+ router binary (PR ggml-org/llama.cpp#22673). The 27B model (`qwen3.8-27b-q4-mtp`) uses `models/Qwen3.8-27B-UD-Q4_K_XL.gguf`, which ships the MTP draft head baked in.
 
 Embed side — `embed_proxy.py` is hardcoded to a single model (`MODEL_FILE`, `MODEL_ID`, `CTX_SIZE` constants at the top). Change those if you swap the embedder.
 
