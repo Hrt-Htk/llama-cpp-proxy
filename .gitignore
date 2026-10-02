@@ -61,3 +61,7 @@ _pi_tasks/
 # Generated test artifacts (harness output; regenerated per run)
 tests/_assets/
 tests/acceptance-results/
+
+# Local llama.cpp binary drops (never committed)
+llama.cpp_latest/
+llama.cpp_v040/
