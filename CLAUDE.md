@@ -32,7 +32,7 @@ Bare `/v1/...` at the root also still hits the chat router
 
 ## Binaries & data
 
-- `llama.cpp_latest/llama-server.exe` — current router binary (b9209+ for MTP).
+- `llama.cpp_latest/llama-server.exe` — current router binary (**v0.4.0**, build 10816, commit 427291b5b). Backup: `llama.cpp_latest_v9670/` (previous), `llama.cpp_latest_b9209_bak/`.
 - `models/` — GGUF weights. `models/_aux/` holds mmproj projectors.
 
 ## External
@@ -48,7 +48,7 @@ All under `logs/<week>/`. Daily-rotated, bucketed by ISO week. Two pairs (`proxy
 
 - **Router stays up across model loads/unloads** — that's the whole point. Don't kill the router process on idle; only call `/models/unload`.
 - **`--models-max 1` per router** — loading a different model evicts the current one. The two routers don't share state, so chat and embedder coexist fine.
-- **MTP (built-in speculative decoding)** — `spec_mtp=True` on a `ModelChoice` enables it (emits `spec-type=draft-mtp` etc. in the preset; see `proxy_config.py` for the current 27B setup). Requires the b9209+ router binary and a build supporting the model's GGUF arch. Only one model loads at a time, so the extra preset costs no VRAM unless selected.
+- **MTP (built-in speculative decoding)** — `spec_mtp=True` on a `ModelChoice` enables it (emits `spec-type=draft-mtp` etc. in the preset; see `proxy_config.py` for the current 27B setup). Requires a binary supporting MTP and the model's GGUF arch (v0.4.0+). Only one model loads at a time, so the extra preset costs no VRAM unless selected.
 - **API key** comes from `$env:LLAMA_API_KEY` with a hardcoded fallback in both proxies. The proxies inject `Authorization: Bearer …` if the client omits it.
 - **Preset IDs are the API model names** — `<base-id>-<ctx>k`, generated from `MODELS` × `CTX_CHOICES` in `proxy_config.py` (don't hardcode the list here; it rots). Clients pick via the `model` field in the request body.
 - **KV cache is quantized** — `cache-type-k = q4_0`, `cache-type-v = q4_0` in all presets.

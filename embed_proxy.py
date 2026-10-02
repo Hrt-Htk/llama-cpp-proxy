@@ -51,12 +51,14 @@ class EmbedProxyConfig(ProxyConfig):
     @property
     def server_command(self) -> list[str]:
         log_file = current_week_dir(ROOT / "logs") / f"embed-server-{local_now().strftime(DATE_FMT)}.log"
+        server_exe = self.server_exe or SERVER_EXE
+        preset_path = self.preset_path or PRESET_PATH
         return [
-            str(SERVER_EXE),
+            str(server_exe),
             "--log-file", str(log_file),
             "--log-timestamps",
             "--log-prefix",
-            "--models-preset", str(PRESET_PATH),
+            "--models-preset", str(preset_path),
             "--models-max", "1",
             "--no-models-autoload",
             "--host", self.server_host,
@@ -65,7 +67,7 @@ class EmbedProxyConfig(ProxyConfig):
         ]
 
 
-def write_preset() -> None:
+def write_preset(preset_path: Path = PRESET_PATH) -> None:
     content = (
         f"[{MODEL_ID}]\n"
         f"model         = {MODEL_FILE.as_posix()}\n"
@@ -76,7 +78,7 @@ def write_preset() -> None:
         f"flash-attn    = on\n"
         f"no-mmap       = 1\n"
     )
-    PRESET_PATH.write_text(content, encoding="utf-8")
+    preset_path.write_text(content, encoding="utf-8")
 
 
 def build_config() -> ProxyConfig:
@@ -90,14 +92,20 @@ def build_config() -> ProxyConfig:
     p.add_argument("--health-poll-interval", type=float, default=HEALTH_POLL_INTERVAL)
     p.add_argument("--boot-timeout", type=int, default=BOOT_TIMEOUT)
     p.add_argument("--api-key", default=API_KEY)
+    p.add_argument("--server-exe", default=None,
+                   help="Path to llama-server.exe (default: llama.cpp_latest/llama-server.exe)")
+    p.add_argument("--preset-path", default=None,
+                   help="Path to embed-preset.ini (default: embed-preset.ini)")
     args = p.parse_args()
 
-    if not SERVER_EXE.exists():
-        raise SystemExit(f"Missing required file: {SERVER_EXE}")
+    server_exe = Path(args.server_exe) if args.server_exe else SERVER_EXE
+    preset_path = Path(args.preset_path) if args.preset_path else PRESET_PATH
+    if not server_exe.exists():
+        raise SystemExit(f"Missing required file: {server_exe}")
     if not MODEL_FILE.exists():
         raise SystemExit(f"Missing embedding model: {MODEL_FILE}")
 
-    write_preset()
+    write_preset(preset_path)
     print(f"Embed proxy default: {MODEL_ID} @ {CTX_SIZE // 1024}k ctx")
 
     return EmbedProxyConfig(
@@ -111,6 +119,8 @@ def build_config() -> ProxyConfig:
         boot_timeout=args.boot_timeout,
         default_model=MODEL_ID,
         api_key=args.api_key,
+        server_exe=server_exe,
+        preset_path=preset_path,
     )
 
 

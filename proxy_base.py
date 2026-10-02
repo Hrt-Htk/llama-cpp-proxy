@@ -115,6 +115,8 @@ class ProxyConfig:
     embed_host: str | None = None
     embed_port: int | None = None
     chat_log: bool = True
+    server_exe: Path | None = None   # override for llama-server.exe (test stacks)
+    preset_path: Path | None = None  # override for the generated preset INI
 
     @property
     def backend_base_url(self) -> str:

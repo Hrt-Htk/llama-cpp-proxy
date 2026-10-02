@@ -90,12 +90,14 @@ class ChatProxyConfig(ProxyConfig):
     @property
     def server_command(self) -> list[str]:
         log_file = current_week_dir(ROOT / "logs") / f"llama-server-{local_now().strftime(DATE_FMT)}.log"
+        server_exe = self.server_exe or SERVER_EXE
+        preset_path = self.preset_path or PRESET_PATH
         return [
-            str(SERVER_EXE),
+            str(server_exe),
             "--log-file", str(log_file),
             "--log-timestamps",
             "--log-prefix",
-            "--models-preset", str(PRESET_PATH),
+            "--models-preset", str(preset_path),
             "--models-max", "1",
             "--no-models-autoload",
             # Chat template is set PER-PRESET (chat-template-file in each section),
@@ -173,7 +175,11 @@ def _model_preset_section(model: ModelChoice, ctx: int) -> str:
     )
 
 
-def write_preset(models: list[ModelChoice], ctx_choices: list[int]) -> None:
+def write_preset(
+    models: list[ModelChoice],
+    ctx_choices: list[int],
+    preset_path: Path = PRESET_PATH,
+) -> None:
     """Generate models-preset.ini with every (model, ctx) combination.
 
     Each combo becomes a distinct preset id (e.g. `qwen3.6-35b-q3-128k`),
@@ -186,7 +192,7 @@ def write_preset(models: list[ModelChoice], ctx_choices: list[int]) -> None:
         for ctx in m.contexts(ctx_choices)
     ]
     content = "\n".join(sections) + "\n"
-    PRESET_PATH.write_text(content, encoding="utf-8")
+    preset_path.write_text(content, encoding="utf-8")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -208,17 +214,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--embed-host", default=EMBED_PROXY_HOST)
     p.add_argument("--embed-port", type=int, default=EMBED_PROXY_PORT)
     p.add_argument("--no-chat-log", action="store_true")
+    p.add_argument("--server-exe", default=None,
+                   help="Path to llama-server.exe (default: llama.cpp_latest/llama-server.exe)")
+    p.add_argument("--preset-path", default=None,
+                   help="Path to models-preset.ini (default: models-preset.ini)")
     return p
 
 
 def build_config() -> ProxyConfig:
     args = _build_arg_parser().parse_args()
 
-    if not SERVER_EXE.exists():
-        raise SystemExit(f"Missing required file: {SERVER_EXE}")
+    server_exe = Path(args.server_exe) if args.server_exe else SERVER_EXE
+    preset_path = Path(args.preset_path) if args.preset_path else PRESET_PATH
+    if not server_exe.exists():
+        raise SystemExit(f"Missing required file: {server_exe}")
 
     model, ctx = pick_setup(args.model, args.ctx_size)
-    write_preset(MODELS, CTX_CHOICES)
+    write_preset(MODELS, CTX_CHOICES, preset_path)
     default_id = model.preset_id(ctx)
     n_presets = sum(len(m.contexts(CTX_CHOICES)) for m in MODELS)
     print(f"Default: {model.label} @ {ctx // 1024}k ctx (id: {default_id})")
@@ -238,4 +250,6 @@ def build_config() -> ProxyConfig:
         embed_host=args.embed_host,
         embed_port=args.embed_port,
         chat_log=not args.no_chat_log,
+        server_exe=server_exe,
+        preset_path=preset_path,
     )
